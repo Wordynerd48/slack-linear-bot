@@ -1259,6 +1259,78 @@ def home():
     return {"message": "Slack Linear bot is running"}
 
 
+@app.post("/slack/interactive")
+async def slack_interactive(request: Request, background_tasks: BackgroundTasks):
+    body = await request.body()
+
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    slack_signature = request.headers.get("X-Slack-Signature")
+
+    if not verify_slack_request(body, timestamp, slack_signature):
+        return {
+            "response_type": "ephemeral",
+            "text": "Request verification failed.",
+        }
+
+    form = await request.form()
+    payload_raw = form.get("payload")
+
+    if not payload_raw:
+        return {
+            "response_type": "ephemeral",
+            "text": "Missing Slack interaction payload.",
+        }
+
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError:
+        logger.exception("Could not parse Slack interaction payload")
+        return {
+            "response_type": "ephemeral",
+            "text": "Couldn’t parse the Slack interaction payload.",
+        }
+
+    interaction_type = payload.get("type")
+    callback_id = payload.get("callback_id")
+
+    if interaction_type != "message_action" or callback_id != "analyze_thread_for_linear":
+        return {
+            "response_type": "ephemeral",
+            "text": "Unsupported Slack shortcut.",
+        }
+
+    channel = payload.get("channel", {})
+    message = payload.get("message", {})
+    response_url = payload.get("response_url")
+
+    channel_id = channel.get("id")
+    thread_ts = message.get("thread_ts") or message.get("ts")
+
+    if not channel_id or not thread_ts or not response_url:
+        logger.warning(
+            "Slack shortcut missing required context: channel_id=%s thread_ts=%s response_url_present=%s",
+            bool(channel_id),
+            bool(thread_ts),
+            bool(response_url),
+        )
+        return {
+            "response_type": "ephemeral",
+            "text": "Couldn’t find the channel, thread, or response URL for this message.",
+        }
+
+    background_tasks.add_task(
+        process_analyze_thread_and_respond,
+        channel_id,
+        thread_ts,
+        response_url,
+    )
+
+    return {
+        "response_type": "ephemeral",
+        "text": "Working on the Slack thread analysis...",
+    }
+
+
 @app.post("/slack/command")
 async def slack_command(request: Request, background_tasks: BackgroundTasks):
     body = await request.body()
