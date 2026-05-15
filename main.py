@@ -528,11 +528,19 @@ def find_existing_linear_issue_match(proposed_issue, existing_issues, source_url
 
     return None
 
-def mark_existing_issue_match(proposed_issue, match):
+def mark_existing_issue_match(proposed_issue, match, match_type="possible_duplicate"):
     proposed_issue["existing_issue_match"] = (
         f"{match['identifier']}: {match['title']}\n  {match['url']}"
     )
     proposed_issue["existing_issue_url"] = match.get("url", "")
+    proposed_issue["existing_issue_match_type"] = match_type
+
+
+def existing_issue_match_type(existing_issue, source_key=""):
+    if source_key and issue_contains_source_key(existing_issue, source_key):
+        return "already_tracked"
+
+    return "possible_duplicate"
 
 
 def annotate_existing_linear_matches(analysis, source_url="", source_key=""):
@@ -555,7 +563,11 @@ def annotate_existing_linear_matches(analysis, source_url="", source_key=""):
         )
 
         if match:
-            mark_existing_issue_match(proposed_issue, match)
+            mark_existing_issue_match(
+                proposed_issue,
+                match,
+                existing_issue_match_type(match, source_key),
+            )
             logger.info(
                 "Matched proposed issue '%s' to existing Linear issue %s",
                 proposed_issue.get("title", ""),
@@ -1374,12 +1386,19 @@ def format_thread_analysis_response(analysis, source_url=""):
                 label = field.replace("_", " ").title()
 
                 if field == "existing_issue_match":
-                    label = "Possible Existing Linear Issue"
+                    if item.get("existing_issue_match_type") == "already_tracked":
+                        label = "Already Tracked Linear Issue"
+                    else:
+                        label = "Possible Existing Linear Issue"
 
                 lines.append(f"   {label}: {value}")
                 displayed_values.add(normalized_value)
 
         lines.append("")
+
+    proposed_issues = analysis.get("proposed_issues", []) or []
+    if proposed_issues and not createable_proposed_issues(proposed_issues):
+        lines.append("All proposed Linear issues appear to already be tracked. No create button is shown.")
 
     return "\n".join(lines).strip()
 
@@ -1546,7 +1565,11 @@ def create_linear_issues_from_preview(preview):
         )
 
         if match:
-            mark_existing_issue_match(proposed_issue, match)
+            mark_existing_issue_match(
+                proposed_issue,
+                match,
+                existing_issue_match_type(match, source_key),
+            )
             skipped_issues.append(proposed_issue)
             logger.info(
                 "Skipped proposed issue '%s' because it matched existing Linear issue %s",
