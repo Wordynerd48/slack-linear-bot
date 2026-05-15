@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 
 import requests
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from openai import OpenAI
 
 load_dotenv()
@@ -1605,17 +1605,23 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
         if action_id == "cancel_thread_issues":
             PENDING_THREAD_PREVIEWS.pop(preview_id, None)
-            return {
-                "response_type": "ephemeral",
-                "text": "Cancelled. No Linear issues were created.",
-            }
+
+            if response_url:
+                requests.post(
+                    response_url,
+                    json={
+                        "response_type": "ephemeral",
+                        "text": "Cancelled. No Linear issues were created.",
+                    },
+                    timeout=10,
+                )
+
+            return Response(status_code=200)
 
         if action_id == "create_thread_issues":
             if not preview_id or not response_url:
-                return {
-                    "response_type": "ephemeral",
-                    "text": "Couldn’t find the saved thread preview.",
-                }
+                logger.warning("Slack create action missing preview_id or response_url")
+                return Response(status_code=200)
 
             background_tasks.add_task(
                 process_create_thread_issues_and_respond,
@@ -1623,21 +1629,18 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
                 response_url,
             )
 
-            return {
-                "response_type": "ephemeral",
-                "text": "Creating Linear issues from the thread preview...",
-            }
+            return Response(status_code=200)
 
-        return {
-            "response_type": "ephemeral",
-            "text": "Unsupported Slack button action.",
-        }
+        logger.info("Ignoring unsupported Slack button action: %s", action_id)
+        return Response(status_code=200)
 
     if interaction_type != "message_action" or callback_id != "analyze_thread_for_linear":
-        return {
-            "response_type": "ephemeral",
-            "text": "Unsupported Slack shortcut.",
-        }
+        logger.info(
+            "Ignoring unsupported Slack interaction: type=%s callback_id=%s",
+            interaction_type,
+            callback_id,
+        )
+        return Response(status_code=200)
 
     channel = payload.get("channel", {})
     message = payload.get("message", {})
@@ -1654,10 +1657,17 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
             bool(thread_ts),
             bool(response_url),
         )
-        return {
-            "response_type": "ephemeral",
-            "text": "Couldn’t find the channel, thread, or response URL for this message.",
-        }
+        if response_url:
+            requests.post(
+                response_url,
+                json={
+                    "response_type": "ephemeral",
+                    "text": "Couldn’t find the channel, thread, or response URL for this message.",
+                },
+                timeout=10,
+            )
+
+        return Response(status_code=200)
 
     background_tasks.add_task(
         process_analyze_thread_and_respond,
@@ -1667,10 +1677,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
         requester_slack_user_id,
     )
 
-    return {
-        "response_type": "ephemeral",
-        "text": "Working on the Slack thread analysis...",
-    }
+    return Response(status_code=200)
 
 
 @app.post("/slack/command")
