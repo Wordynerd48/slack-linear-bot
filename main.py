@@ -350,7 +350,6 @@ def create_linear_issue(
 
 def parse_task_with_ai(raw_text):
     today_date = date.today()
-    today_date = date.today()
     today = today_date.isoformat()
 
     schema = {
@@ -436,7 +435,8 @@ def analyze_thread_with_ai(messages):
             "proposed_issues": [],
         }
 
-    today = date.today().isoformat()
+    today_date = date.today()
+    today = today_date.isoformat()
     cleaned_messages = [
         {
             "user": message.get("user", ""),
@@ -574,6 +574,11 @@ def analyze_thread_with_ai(messages):
                     f"({today_date.strftime('%A')}). For named weekdays, use today if it matches, "
                     "otherwise use the next matching weekday after today. If a due date is vague, "
                     "such as 'after that,' leave due_date as an empty string. "
+                    "Use the message user field as the speaker name. If a speaker uses first-person "
+                    "ownership language like 'I can,', 'I will,', 'I\'ll,', 'I should,', or 'I need to,' "
+                    "set assignee_name to that speaker for the corresponding action item and proposed issue. "
+                    "For example, if Evan says 'I can fix it by Friday,', assignee_name should be 'Evan'. "
+                    "If Sarah says 'I\'ll test OAuth edge cases,', assignee_name should be 'Sarah'. "
                     "Use an empty string for missing assignee_name, owner, or due_date. "
                     "Use priority 'none' when no priority is implied."
                 ),
@@ -594,10 +599,12 @@ def analyze_thread_with_ai(messages):
     )
 
     analysis = json.loads(response.output_text)
+    analysis = apply_speaker_assignee_inference(analysis, cleaned_messages)
     analysis["proposed_issues"] = ensure_proposed_issues_for_action_items(
         analysis.get("action_items", []),
         analysis.get("proposed_issues", []),
     )
+    analysis = apply_speaker_assignee_inference(analysis, cleaned_messages)
     analysis = clean_thread_analysis(analysis, today_date)
     logger.info(
         "AI analyzed Slack thread with %s messages, %s action items, and %s proposed issues",
@@ -668,6 +675,146 @@ def ensure_proposed_issues_for_action_items(action_items, proposed_issues):
         proposed_issues.append(proposed_issue_from_action_item(action_item))
 
     return proposed_issues
+
+
+FIRST_PERSON_OWNERSHIP_PATTERNS = [
+    r"\bi can\b",
+    r"\bi will\b",
+    r"\bi['’]ll\b",
+    r"\bi should\b",
+    r"\bi need to\b",
+    r"\bi can take\b",
+    r"\bi can fix\b",
+    r"\bi can test\b",
+    r"\bi'll take\b",
+    r"\bi’ll take\b",
+]
+
+
+THREAD_MATCH_STOPWORDS = {
+    "the",
+    "and",
+    "that",
+    "this",
+    "with",
+    "from",
+    "after",
+    "before",
+    "will",
+    "need",
+    "needs",
+    "should",
+    "could",
+    "would",
+    "have",
+    "has",
+    "for",
+    "too",
+    "fix",
+    "test",
+}
+
+
+def has_first_person_ownership(text):
+    text = normalize_name(text)
+
+    return any(
+        re.search(pattern, text)
+        for pattern in FIRST_PERSON_OWNERSHIP_PATTERNS
+    )
+
+
+def meaningful_tokens(text):
+    tokens = re.findall(r"[a-z0-9]+", normalize_name(text))
+
+    return {
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in THREAD_MATCH_STOPWORDS
+    }
+
+
+def token_overlap_score(a, b):
+    a_tokens = meaningful_tokens(a)
+    b_tokens = meaningful_tokens(b)
+
+    if not a_tokens or not b_tokens:
+        return 0
+
+    return len(a_tokens & b_tokens) / min(len(a_tokens), len(b_tokens))
+
+
+def infer_speaker_assignee_for_item(item, messages, primary_fields):
+    current_assignee = clean_text(item.get("assignee_name", ""))
+
+    if current_assignee:
+        return current_assignee
+
+    item_text = " ".join(
+        clean_text(item.get(field, ""))
+        for field in primary_fields
+    )
+
+    best_user = ""
+    best_score = 0
+
+    for message in messages:
+        user = clean_text(message.get("user", ""))
+        message_text = clean_text(message.get("text", ""))
+
+        if not user or not message_text:
+            continue
+
+        if not has_first_person_ownership(message_text):
+            continue
+
+        score = max(
+            token_overlap_score(item_text, message_text),
+            token_overlap_score(item.get("evidence", ""), message_text),
+        )
+
+        evidence = normalize_name(item.get("evidence", ""))
+        normalized_message = normalize_name(message_text)
+
+        if evidence and (
+            evidence in normalized_message or normalized_message in evidence
+        ):
+            score = max(score, 1.0)
+
+        if score > best_score:
+            best_score = score
+            best_user = user
+
+    if best_score >= 0.2:
+        return best_user
+
+    return ""
+
+
+def apply_speaker_assignee_inference(analysis, messages):
+    messages = messages or []
+
+    for item in analysis.get("action_items", []) or []:
+        inferred_assignee = infer_speaker_assignee_for_item(
+            item,
+            messages,
+            ["task", "evidence"],
+        )
+
+        if inferred_assignee:
+            item["assignee_name"] = inferred_assignee
+
+    for item in analysis.get("proposed_issues", []) or []:
+        inferred_assignee = infer_speaker_assignee_for_item(
+            item,
+            messages,
+            ["title", "description", "evidence"],
+        )
+
+        if inferred_assignee:
+            item["assignee_name"] = inferred_assignee
+
+    return analysis
 
 
 def clean_text(value):
