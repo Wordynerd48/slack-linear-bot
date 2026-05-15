@@ -350,6 +350,7 @@ def create_linear_issue(
 
 def parse_task_with_ai(raw_text):
     today_date = date.today()
+    today_date = date.today()
     today = today_date.isoformat()
 
     schema = {
