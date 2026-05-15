@@ -579,81 +579,6 @@ def annotate_existing_linear_matches(analysis, source_url="", source_key=""):
 
 
 
-def parse_task_with_ai(raw_text):
-    today_date = date.today()
-    today = today_date.isoformat()
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "title": {
-                "type": "string",
-                "description": "A short Linear issue title.",
-            },
-            "description": {
-                "type": "string",
-                "description": "A clear Linear issue description with useful context.",
-            },
-            "priority": {
-                "type": "string",
-                "enum": ["none", "low", "medium", "high", "urgent"],
-                "description": "The task priority inferred from the message.",
-            },
-            "assignee_name": {
-                "type": "string",
-                "description": "The person's name if an assignee is mentioned. Use 'me' if the user assigns the task to themselves.",
-            },
-            "due_date": {
-                "type": "string",
-                "description": "Due date in YYYY-MM-DD format if mentioned, otherwise an empty string.",
-            },
-        },
-        "required": [
-            "title",
-            "description",
-            "priority",
-            "assignee_name",
-            "due_date",
-        ],
-        "additionalProperties": False,
-    }
-
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "Extract a clean Linear issue from the user's Slack message. "
-                    "Do not invent facts. "
-                    f"If a due date is relative, infer it using today's date: {today}. "
-                    "If the user says they need to do something, must do something, will do something, "
-                    "or uses first-person language like 'I,' 'me,' 'my,' or 'myself,' set assignee_name to 'me'. "
-                    "If the user names another person, set assignee_name to that person's name. "
-                    "Return an empty string for assignee_name only if no assignee is implied. "
-                    "Return an empty string for due_date if no due date is provided."
-                ),
-            },
-            {
-                "role": "user",
-                "content": raw_text,
-            },
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "linear_task",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-    )
-
-    parsed_task = json.loads(response.output_text)
-    logger.info("AI parsed task: %s", parsed_task)
-    return parsed_task
-
-
 def analyze_thread_with_ai(messages):
     if not messages:
         logger.info("Skipping Slack thread analysis because there are no messages")
@@ -1202,28 +1127,6 @@ def clean_thread_analysis(analysis, today_date):
     return cleaned
 
 
-def apply_first_person_fallback(raw_text, assignee_name):
-    if assignee_name:
-        return assignee_name
-
-    raw_text_lower = raw_text.lower()
-    first_person_phrases = [
-        "i need to",
-        "i should",
-        "i will",
-        "i'll",
-        "assign this to me",
-        "assign to me",
-        "me to",
-        "my task",
-    ]
-
-    if any(phrase in raw_text_lower for phrase in first_person_phrases):
-        return "me"
-
-    return assignee_name
-
-
 def format_issue_response(issue, priority, assignee_name="", due_date=""):
     assignee = issue.get("assignee")
     linear_assignee_name = display_linear_user(assignee)
@@ -1248,68 +1151,6 @@ def format_issue_response(issue, priority, assignee_name="", due_date=""):
 
     lines.append(issue["url"])
     return "\n".join(lines)
-
-
-def format_preview_response(parsed_task, slack_user_id):
-    title = parsed_task["title"]
-    description = parsed_task["description"]
-    priority = parsed_task["priority"]
-    assignee_name = parsed_task["assignee_name"]
-    due_date = parsed_task["due_date"]
-
-    assignee = resolve_assignee(assignee_name, slack_user_id)
-    assignee_display = display_linear_user(assignee)
-
-    lines = [
-        "Preview only. No Linear issue was created.",
-        f"Title: {title}",
-        f"Description: {description or 'none'}",
-        f"Priority: {priority}",
-    ]
-
-    if assignee_name:
-        if assignee_display:
-            lines.append(f"Assignee: {assignee_display}")
-        elif normalize_name(assignee_name) in ["i", "me", "myself"]:
-            lines.append("Assignee: couldn’t match your Slack email to a Linear user")
-        else:
-            lines.append(f"Assignee: {assignee_name} could not be matched")
-    else:
-        lines.append("Assignee: none")
-
-    lines.append(f"Due date: {due_date or 'none'}")
-    return "\n".join(lines)
-
-
-def pasted_conversation_to_messages(conversation_text):
-    messages = []
-
-    for index, line in enumerate(conversation_text.splitlines(), start=1):
-        text = line.strip()
-
-        if not text:
-            continue
-
-        user = ""
-
-        if ":" in text:
-            possible_user, possible_text = text.split(":", 1)
-
-            if possible_user.strip() and possible_text.strip():
-                user = possible_user.strip()
-                text = possible_text.strip()
-
-        messages.append(
-            {
-                "user": user,
-                "text": text,
-                "ts": str(index),
-                "thread_ts": "analyze-text",
-            }
-        )
-
-    logger.info("Converted pasted conversation into %s messages", len(messages))
-    return messages
 
 
 def format_thread_analysis_response(analysis, source_url=""):
@@ -1650,14 +1491,7 @@ def process_create_thread_issues_and_respond(preview_id, response_url):
         preview = PENDING_THREAD_PREVIEWS.pop(preview_id, None)
 
         if not preview:
-            requests.post(
-                response_url,
-                json={
-                    "response_type": "ephemeral",
-                    "text": "This thread preview expired or was already used. Please analyze the thread again.",
-                },
-                timeout=10,
-            )
+            logger.info("Ignoring create request for missing or already-used thread preview: %s", preview_id)
             return
 
         created_issues, skipped_issues = create_linear_issues_from_preview(preview)
@@ -1688,33 +1522,6 @@ def process_create_thread_issues_and_respond(preview_id, response_url):
             timeout=10,
         )
 
-
-
-def process_analyze_text_and_respond(conversation_text, response_url):
-    try:
-        messages = pasted_conversation_to_messages(conversation_text)
-        analysis = analyze_thread_with_ai(messages)
-        message = format_thread_analysis_response(analysis)
-
-        requests.post(
-            response_url,
-            json={
-                "response_type": "ephemeral",
-                "text": message,
-            },
-            timeout=10,
-        )
-    except Exception:
-        logger.exception("Error processing pasted Slack thread analysis")
-
-        requests.post(
-            response_url,
-            json={
-                "response_type": "ephemeral",
-                "text": "Couldn’t analyze the pasted conversation. Check the FastAPI terminal for details.",
-            },
-            timeout=10,
-        )
 
 
 def process_analyze_thread_and_respond(channel_id, thread_ts, response_url, requester_slack_user_id=""):
@@ -1748,63 +1555,6 @@ def process_analyze_thread_and_respond(channel_id, thread_ts, response_url, requ
         )
 
 
-
-def process_ai_task_and_respond(raw_text, response_url, slack_user_id, preview=False):
-    try:
-        parsed_task = parse_task_with_ai(raw_text)
-        parsed_task["assignee_name"] = apply_first_person_fallback(
-            raw_text,
-            parsed_task["assignee_name"],
-        )
-
-        if preview:
-            message = format_preview_response(parsed_task, slack_user_id)
-        else:
-            result = create_linear_issue(
-                title=parsed_task["title"],
-                description=parsed_task["description"],
-                priority=parsed_task["priority"],
-                assignee_name=parsed_task["assignee_name"],
-                due_date=parsed_task["due_date"],
-                requester_slack_user_id=slack_user_id,
-            )
-
-            issue = result["data"]["issueCreate"]["issue"]
-            message = format_issue_response(
-                issue=issue,
-                priority=parsed_task["priority"],
-                assignee_name=parsed_task["assignee_name"],
-                due_date=parsed_task["due_date"],
-            )
-
-        requests.post(
-            response_url,
-            json={
-                "response_type": "ephemeral",
-                "text": message,
-            },
-            timeout=10,
-        )
-
-    except Exception as error:
-        logger.exception("Error processing AI Linear issue")
-
-        requests.post(
-            response_url,
-            json={
-                "response_type": "ephemeral",
-                "text": "Couldn’t process the AI-parsed Linear issue. Check the FastAPI terminal for details.",
-            },
-            timeout=10,
-        )
-
-
-def parse_manual_task(command_text):
-    if "|" in command_text:
-        title, description = command_text.split("|", 1)
-        return title.strip(), description.strip()
-
-    return command_text.strip(), ""
 
 
 @app.get("/")
@@ -1936,151 +1686,15 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
             "text": "Request verification failed.",
         }
 
-    form = await request.form()
-    command_text = form.get("text", "").strip()
-    response_url = form.get("response_url")
-    slack_user_id = form.get("user_id")
-
-    if not command_text:
-        return {
-            "response_type": "ephemeral",
-            "text": "Please include a task. Example: `/linear-task Fix login bug`",
-        }
-
-    command_lower = command_text.lower()
-
-    if command_lower in ["help", "--help", "-h"]:
-        return {
-            "response_type": "ephemeral",
-            "text": (
-                "Linear Bot examples:\n"
-                "• `/linear-task Fix login bug`\n"
-                "• `/linear-task Fix login bug | Login redirects after OAuth.`\n"
-                "• `/linear-task ai: I need to fix the login redirect bug by Friday and make it urgent`\n"
-                "• `/linear-task preview ai: I need to fix the login redirect bug by Friday and make it urgent`\n"
-                "• `/linear-task analyze-text ai: Evan: I can fix the bug by Friday.`\n"
-                "• `/linear-task analyze-thread CHANNEL_ID THREAD_TS`\n\n"
-                "Use `ai:` to create a Linear issue from natural language.\n"
-                "Use `preview ai:` to see what would be created without creating an issue.\n"
-                "Use `analyze-text ai:` or `analyze-thread` to preview action items from conversations."
-            ),
-        }
-
-    if command_lower.startswith("analyze-thread "):
-        parts = command_text.split()
-
-        if len(parts) != 3:
-            return {
-                "response_type": "ephemeral",
-                "text": "Usage: `/linear-task analyze-thread CHANNEL_ID THREAD_TS`",
-            }
-
-        _, channel_id, thread_ts = parts
-
-        background_tasks.add_task(
-            process_analyze_thread_and_respond,
-            channel_id,
-            thread_ts,
-            response_url,
-            slack_user_id,
-        )
-
-        return {
-            "response_type": "ephemeral",
-            "text": "Working on the Slack thread analysis...",
-        }
-
-    if command_lower.startswith("analyze-text ai:"):
-        conversation_text = command_text[len("analyze-text ai:"):].strip()
-
-        if not conversation_text:
-            return {
-                "response_type": "ephemeral",
-                "text": "Please include pasted conversation text after `analyze-text ai:`.",
-            }
-
-        background_tasks.add_task(
-            process_analyze_text_and_respond,
-            conversation_text,
-            response_url,
-        )
-
-        return {
-            "response_type": "ephemeral",
-            "text": "Working on the pasted conversation analysis...",
-        }
-
-    if command_lower.startswith("preview ai:"):
-        raw_text = command_text[len("preview ai:"):].strip()
-
-        if not raw_text:
-            return {
-                "response_type": "ephemeral",
-                "text": "Please include a task after `preview ai:`.",
-            }
-
-        background_tasks.add_task(
-            process_ai_task_and_respond,
-            raw_text,
-            response_url,
-            slack_user_id,
-            True,
-        )
-
-        return {
-            "response_type": "ephemeral",
-            "text": "Working on the AI preview...",
-        }
-
-    if command_lower.startswith("ai:"):
-        raw_text = command_text[3:].strip()
-
-        if not raw_text:
-            return {
-                "response_type": "ephemeral",
-                "text": "Please include a task after `ai:`.",
-            }
-
-        background_tasks.add_task(
-            process_ai_task_and_respond,
-            raw_text,
-            response_url,
-            slack_user_id,
-            False,
-        )
-
-        return {
-            "response_type": "ephemeral",
-            "text": "Working on the AI-parsed Linear issue...",
-        }
-
-    title, description = parse_manual_task(command_text)
-
-    if not title:
-        return {
-            "response_type": "ephemeral",
-            "text": "Please include a task title before the `|`.",
-        }
-
-    try:
-        priority = "none"
-        result = create_linear_issue(
-            title=title,
-            description=description,
-            priority=priority,
-        )
-
-        issue = result["data"]["issueCreate"]["issue"]
-
-        return {
-            "response_type": "ephemeral",
-            "text": format_issue_response(issue, priority),
-        }
-
-    except Exception:
-        logger.exception("Error creating manual Linear issue")
-
-        return {
-            "response_type": "ephemeral",
-            "text": "Couldn’t create the Linear issue. Check the FastAPI terminal for details.",
-        }
+    return {
+        "response_type": "ephemeral",
+        "text": (
+            "Linear Bot now focuses on Slack thread analysis.\n\n"
+            "Use the message shortcut instead:\n"
+            "1. Open a Slack thread.\n"
+            "2. Click the three-dot menu on the parent message.\n"
+            "3. Choose `Analyze thread for Linear issues`.\n"
+            "4. Review the preview, then click `Create new Linear issue(s)` or `Cancel`.\n\n"
+            "The old single-message `/linear-task ai:` and pasted-text test modes have been removed."
+        ),
+    }
