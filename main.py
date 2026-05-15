@@ -347,7 +347,7 @@ def parse_task_with_ai(raw_text):
     }
 
     response = client.responses.create(
-        model="gpt-4.1-nano"
+        model="gpt-4.1-nano",
         input=[
             {
                 "role": "system",
