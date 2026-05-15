@@ -28,6 +28,7 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
 LINEAR_API_URL = "https://api.linear.app/graphql"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
 
 
 @app.on_event("startup")
@@ -88,6 +89,44 @@ def slack_api_get(endpoint, params=None):
         raise RuntimeError(f"Slack API error from {endpoint}: {data}")
 
     return data
+
+
+def fetch_slack_thread(channel_id, thread_ts):
+    if not channel_id:
+        raise ValueError("channel_id is required")
+
+    if not thread_ts:
+        raise ValueError("thread_ts is required")
+
+    try:
+        data = slack_api_get(
+            "conversations.replies",
+            {
+                "channel": channel_id,
+                "ts": thread_ts,
+            },
+        )
+    except requests.RequestException as error:
+        logger.exception("Slack thread fetch failed due to an HTTP error")
+        raise RuntimeError("Could not fetch Slack thread") from error
+    except Exception as error:
+        logger.exception("Slack thread fetch failed")
+        raise RuntimeError("Could not fetch Slack thread") from error
+
+    messages = []
+
+    for message in data.get("messages", []):
+        messages.append(
+            {
+                "user": message.get("user", ""),
+                "text": message.get("text", ""),
+                "ts": message.get("ts", ""),
+                "thread_ts": message.get("thread_ts") or message.get("ts", ""),
+            }
+        )
+
+    logger.info("Fetched Slack thread with %s messages", len(messages))
+    return messages
 
 
 def get_slack_user_email(slack_user_id):
@@ -347,7 +386,7 @@ def parse_task_with_ai(raw_text):
     }
 
     response = client.responses.create(
-        model="gpt-4.1-nano",
+        model=OPENAI_MODEL,
         input=[
             {
                 "role": "system",
@@ -380,6 +419,175 @@ def parse_task_with_ai(raw_text):
     parsed_task = json.loads(response.output_text)
     logger.info("AI parsed task: %s", parsed_task)
     return parsed_task
+
+
+def analyze_thread_with_ai(messages):
+    if not messages:
+        logger.info("Skipping Slack thread analysis because there are no messages")
+        return {
+            "summary": "",
+            "decisions": [],
+            "action_items": [],
+            "blockers": [],
+            "unresolved_questions": [],
+            "proposed_issues": [],
+        }
+
+    today = date.today().isoformat()
+    cleaned_messages = [
+        {
+            "user": message.get("user", ""),
+            "text": message.get("text", ""),
+            "ts": message.get("ts", ""),
+            "thread_ts": message.get("thread_ts", ""),
+        }
+        for message in messages
+    ]
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "A short summary of the Slack thread.",
+            },
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "decision": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["decision", "evidence"],
+                    "additionalProperties": False,
+                },
+            },
+            "action_items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string"},
+                        "assignee_name": {"type": "string"},
+                        "due_date": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["none", "low", "medium", "high", "urgent"],
+                        },
+                        "evidence": {"type": "string"},
+                    },
+                    "required": [
+                        "task",
+                        "assignee_name",
+                        "due_date",
+                        "priority",
+                        "evidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "blockers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "blocker": {"type": "string"},
+                        "owner": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["blocker", "owner", "evidence"],
+                    "additionalProperties": False,
+                },
+            },
+            "unresolved_questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": ["question", "evidence"],
+                    "additionalProperties": False,
+                },
+            },
+            "proposed_issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["none", "low", "medium", "high", "urgent"],
+                        },
+                        "assignee_name": {"type": "string"},
+                        "due_date": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": [
+                        "title",
+                        "description",
+                        "priority",
+                        "assignee_name",
+                        "due_date",
+                        "evidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": [
+            "summary",
+            "decisions",
+            "action_items",
+            "blockers",
+            "unresolved_questions",
+            "proposed_issues",
+        ],
+        "additionalProperties": False,
+    }
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Analyze the Slack thread and extract only information supported by the messages. "
+                    "Do not invent facts, owners, deadlines, priorities, decisions, blockers, or questions. "
+                    "If the thread does not contain actionable work, return empty arrays for action_items "
+                    "and proposed_issues. Keep evidence short and specific, using a brief quote or paraphrase. "
+                    f"If a due date is relative, infer it using today's date: {today}. "
+                    "Use an empty string for missing assignee_name, owner, or due_date. "
+                    "Use priority 'none' when no priority is implied."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(cleaned_messages),
+            },
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "slack_thread_analysis",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    )
+
+    analysis = json.loads(response.output_text)
+    logger.info(
+        "AI analyzed Slack thread with %s messages, %s action items, and %s proposed issues",
+        len(cleaned_messages),
+        len(analysis.get("action_items", [])),
+        len(analysis.get("proposed_issues", [])),
+    )
+    return analysis
 
 
 def apply_first_person_fallback(raw_text, assignee_name):
@@ -459,6 +667,115 @@ def format_preview_response(parsed_task, slack_user_id):
 
     lines.append(f"Due date: {due_date or 'none'}")
     return "\n".join(lines)
+
+
+def pasted_conversation_to_messages(conversation_text):
+    messages = []
+
+    for index, line in enumerate(conversation_text.splitlines(), start=1):
+        text = line.strip()
+
+        if not text:
+            continue
+
+        user = ""
+
+        if ":" in text:
+            possible_user, possible_text = text.split(":", 1)
+
+            if possible_user.strip() and possible_text.strip():
+                user = possible_user.strip()
+                text = possible_text.strip()
+
+        messages.append(
+            {
+                "user": user,
+                "text": text,
+                "ts": str(index),
+                "thread_ts": "analyze-text",
+            }
+        )
+
+    logger.info("Converted pasted conversation into %s messages", len(messages))
+    return messages
+
+
+def format_thread_analysis_response(analysis):
+    lines = [
+        "Thread analysis preview. No Linear issues were created.",
+        "",
+        "Summary",
+        analysis.get("summary") or "No summary available.",
+        "",
+    ]
+
+    sections = [
+        ("Decisions", analysis.get("decisions", []), ["decision", "evidence"]),
+        ("Action items", analysis.get("action_items", []), ["task", "assignee_name", "due_date", "priority", "evidence"]),
+        ("Blockers", analysis.get("blockers", []), ["blocker", "owner", "evidence"]),
+        ("Unresolved questions", analysis.get("unresolved_questions", []), ["question", "evidence"]),
+        (
+            "Proposed Linear issues",
+            analysis.get("proposed_issues", []),
+            ["title", "description", "priority", "assignee_name", "due_date", "evidence"],
+        ),
+    ]
+
+    found_anything = any(items for _, items, _ in sections)
+
+    if not found_anything:
+        lines.append("Nothing actionable was found in this conversation.")
+        return "\n".join(lines)
+
+    for section_title, items, fields in sections:
+        lines.append(section_title)
+
+        if not items:
+            lines.append("None")
+            lines.append("")
+            continue
+
+        for index, item in enumerate(items, start=1):
+            primary_field = fields[0]
+            lines.append(f"{index}. {item.get(primary_field, '')}")
+
+            for field in fields[1:]:
+                value = item.get(field, "")
+
+                if value:
+                    label = field.replace("_", " ").title()
+                    lines.append(f"   {label}: {value}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def process_analyze_text_and_respond(conversation_text, response_url):
+    try:
+        messages = pasted_conversation_to_messages(conversation_text)
+        analysis = analyze_thread_with_ai(messages)
+        message = format_thread_analysis_response(analysis)
+
+        requests.post(
+            response_url,
+            json={
+                "response_type": "ephemeral",
+                "text": message,
+            },
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("Error processing pasted Slack thread analysis")
+
+        requests.post(
+            response_url,
+            json={
+                "response_type": "ephemeral",
+                "text": "Couldn’t analyze the pasted conversation. Check the FastAPI terminal for details.",
+            },
+            timeout=10,
+        )
 
 
 def process_ai_task_and_respond(raw_text, response_url, slack_user_id, preview=False):
@@ -562,6 +879,26 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
                 "Use `ai:` to create a Linear issue from natural language.\n"
                 "Use `preview ai:` to see what would be created without creating an issue."
             ),
+        }
+
+    if command_lower.startswith("analyze-text ai:"):
+        conversation_text = command_text[len("analyze-text ai:"):].strip()
+
+        if not conversation_text:
+            return {
+                "response_type": "ephemeral",
+                "text": "Please include pasted conversation text after `analyze-text ai:`.",
+            }
+
+        background_tasks.add_task(
+            process_analyze_text_and_respond,
+            conversation_text,
+            response_url,
+        )
+
+        return {
+            "response_type": "ephemeral",
+            "text": "Working on the pasted conversation analysis...",
         }
 
     if command_lower.startswith("preview ai:"):
