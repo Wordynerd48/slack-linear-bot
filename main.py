@@ -559,7 +559,14 @@ def analyze_thread_with_ai(messages):
                     "Analyze the Slack thread and extract only information supported by the messages. "
                     "Do not invent facts, owners, deadlines, priorities, decisions, blockers, or questions. "
                     "If the thread does not contain actionable work, return empty arrays for action_items "
-                    "and proposed_issues. Keep evidence short and specific, using a brief quote or paraphrase. "
+                    "and proposed_issues. Generate proposed_issues from action_items that are specific enough "
+                    "to track in Linear. Clear tasks like fixing a login redirect bug or testing OAuth edge cases "
+                    "should become proposed Linear issues. Be conservative, but do not leave proposed_issues "
+                    "empty when clear action_items exist. Keep evidence short and specific, using a brief quote "
+                    "or paraphrase. "
+                    "If a message asks a question and no later message answers it, include it in "
+                    "unresolved_questions. For example, an unanswered question like "
+                    "'Do we need this fixed on mobile too?' should be unresolved. "
                     f"If a due date is relative, infer it using today's date: {today}. "
                     "Use an empty string for missing assignee_name, owner, or due_date. "
                     "Use priority 'none' when no priority is implied."
@@ -581,6 +588,10 @@ def analyze_thread_with_ai(messages):
     )
 
     analysis = json.loads(response.output_text)
+    analysis["proposed_issues"] = ensure_proposed_issues_for_action_items(
+        analysis.get("action_items", []),
+        analysis.get("proposed_issues", []),
+    )
     logger.info(
         "AI analyzed Slack thread with %s messages, %s action items, and %s proposed issues",
         len(cleaned_messages),
@@ -588,6 +599,73 @@ def analyze_thread_with_ai(messages):
         len(analysis.get("proposed_issues", [])),
     )
     return analysis
+
+
+def is_trackable_action_item(action_item):
+    task = normalize_name(action_item.get("task", ""))
+
+    if not task:
+        return False
+
+    vague_tasks = {
+        "discuss",
+        "follow up",
+        "look into this",
+        "check this",
+        "review",
+        "talk about it",
+    }
+
+    if task in vague_tasks:
+        return False
+
+    return len(task.split()) >= 3 or bool(action_item.get("evidence", "").strip())
+
+
+def proposed_issue_exists(action_item, proposed_issues):
+    task = action_item.get("task", "")
+
+    for issue in proposed_issues:
+        title = issue.get("title", "")
+
+        if similarity(task, title) >= 0.72:
+            return True
+
+    return False
+
+
+def proposed_issue_from_action_item(action_item):
+    task = action_item.get("task", "").strip()
+    evidence = action_item.get("evidence", "").strip()
+
+    description_parts = [task]
+
+    if evidence:
+        description_parts.append(f"Evidence: {evidence}")
+
+    return {
+        "title": task,
+        "description": "\n\n".join(description_parts),
+        "priority": action_item.get("priority") or "none",
+        "assignee_name": action_item.get("assignee_name", ""),
+        "due_date": action_item.get("due_date", ""),
+        "evidence": evidence,
+    }
+
+
+def ensure_proposed_issues_for_action_items(action_items, proposed_issues):
+    proposed_issues = list(proposed_issues or [])
+
+    for action_item in action_items or []:
+        if not is_trackable_action_item(action_item):
+            continue
+
+        if proposed_issue_exists(action_item, proposed_issues):
+            continue
+
+        proposed_issues.append(proposed_issue_from_action_item(action_item))
+
+    return proposed_issues
 
 
 def apply_first_person_fallback(raw_text, assignee_name):
