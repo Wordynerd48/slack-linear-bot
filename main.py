@@ -1169,6 +1169,33 @@ def process_analyze_text_and_respond(conversation_text, response_url):
         )
 
 
+def process_analyze_thread_and_respond(channel_id, thread_ts, response_url):
+    try:
+        messages = fetch_slack_thread(channel_id, thread_ts)
+        analysis = analyze_thread_with_ai(messages)
+        message = format_thread_analysis_response(analysis)
+
+        requests.post(
+            response_url,
+            json={
+                "response_type": "ephemeral",
+                "text": message,
+            },
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("Error processing Slack thread analysis")
+
+        requests.post(
+            response_url,
+            json={
+                "response_type": "ephemeral",
+                "text": "Couldn’t analyze the Slack thread. Check the FastAPI terminal for details.",
+            },
+            timeout=10,
+        )
+
+
 def process_ai_task_and_respond(raw_text, response_url, slack_user_id, preview=False):
     try:
         parsed_task = parse_task_with_ai(raw_text)
@@ -1266,10 +1293,36 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
                 "• `/linear-task Fix login bug`\n"
                 "• `/linear-task Fix login bug | Login redirects after OAuth.`\n"
                 "• `/linear-task ai: I need to fix the login redirect bug by Friday and make it urgent`\n"
-                "• `/linear-task preview ai: I need to fix the login redirect bug by Friday and make it urgent`\n\n"
+                "• `/linear-task preview ai: I need to fix the login redirect bug by Friday and make it urgent`\n"
+                "• `/linear-task analyze-text ai: Evan: I can fix the bug by Friday.`\n"
+                "• `/linear-task analyze-thread CHANNEL_ID THREAD_TS`\n\n"
                 "Use `ai:` to create a Linear issue from natural language.\n"
-                "Use `preview ai:` to see what would be created without creating an issue."
+                "Use `preview ai:` to see what would be created without creating an issue.\n"
+                "Use `analyze-text ai:` or `analyze-thread` to preview action items from conversations."
             ),
+        }
+
+    if command_lower.startswith("analyze-thread "):
+        parts = command_text.split()
+
+        if len(parts) != 3:
+            return {
+                "response_type": "ephemeral",
+                "text": "Usage: `/linear-task analyze-thread CHANNEL_ID THREAD_TS`",
+            }
+
+        _, channel_id, thread_ts = parts
+
+        background_tasks.add_task(
+            process_analyze_thread_and_respond,
+            channel_id,
+            thread_ts,
+            response_url,
+        )
+
+        return {
+            "response_type": "ephemeral",
+            "text": "Working on the Slack thread analysis...",
         }
 
     if command_lower.startswith("analyze-text ai:"):
