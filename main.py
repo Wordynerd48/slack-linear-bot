@@ -3,8 +3,9 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
-from datetime import date
+from datetime import date, timedelta
 from difflib import SequenceMatcher
 
 import requests
@@ -348,7 +349,8 @@ def create_linear_issue(
 
 
 def parse_task_with_ai(raw_text):
-    today = date.today().isoformat()
+    today_date = date.today()
+    today = today_date.isoformat()
 
     schema = {
         "type": "object",
@@ -567,7 +569,10 @@ def analyze_thread_with_ai(messages):
                     "If a message asks a question and no later message answers it, include it in "
                     "unresolved_questions. For example, an unanswered question like "
                     "'Do we need this fixed on mobile too?' should be unresolved. "
-                    f"If a due date is relative, infer it using today's date: {today}. "
+                    f"If a due date is relative, infer it using today's date: {today} "
+                    f"({today_date.strftime('%A')}). For named weekdays, use today if it matches, "
+                    "otherwise use the next matching weekday after today. If a due date is vague, "
+                    "such as 'after that,' leave due_date as an empty string. "
                     "Use an empty string for missing assignee_name, owner, or due_date. "
                     "Use priority 'none' when no priority is implied."
                 ),
@@ -592,6 +597,7 @@ def analyze_thread_with_ai(messages):
         analysis.get("action_items", []),
         analysis.get("proposed_issues", []),
     )
+    analysis = clean_thread_analysis(analysis, today_date)
     logger.info(
         "AI analyzed Slack thread with %s messages, %s action items, and %s proposed issues",
         len(cleaned_messages),
@@ -638,14 +644,9 @@ def proposed_issue_from_action_item(action_item):
     task = action_item.get("task", "").strip()
     evidence = action_item.get("evidence", "").strip()
 
-    description_parts = [task]
-
-    if evidence:
-        description_parts.append(f"Evidence: {evidence}")
-
     return {
         "title": task,
-        "description": "\n\n".join(description_parts),
+        "description": task,
         "priority": action_item.get("priority") or "none",
         "assignee_name": action_item.get("assignee_name", ""),
         "due_date": action_item.get("due_date", ""),
@@ -666,6 +667,160 @@ def ensure_proposed_issues_for_action_items(action_items, proposed_issues):
         proposed_issues.append(proposed_issue_from_action_item(action_item))
 
     return proposed_issues
+
+
+def clean_text(value):
+    return str(value or "").strip()
+
+
+def clean_items(items, primary_field):
+    cleaned = []
+
+    for item in items or []:
+        cleaned_item = {
+            key: clean_text(value)
+            for key, value in item.items()
+        }
+
+        if not cleaned_item.get(primary_field):
+            continue
+
+        cleaned.append(cleaned_item)
+
+    return cleaned
+
+
+def clean_due_date(value, evidence, today_date):
+    value = clean_text(value)
+    evidence_text = normalize_name(evidence)
+
+    if value and has_vague_due_date(evidence_text) and not has_specific_due_date(evidence_text):
+        return ""
+
+    if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return ""
+
+    weekday_due_date = due_date_from_weekday(evidence, today_date)
+
+    if weekday_due_date:
+        return weekday_due_date
+
+    return value
+
+
+def has_vague_due_date(text):
+    vague_phrases = [
+        "after that",
+        "later",
+        "soon",
+        "eventually",
+        "next step",
+        "then",
+    ]
+
+    return any(phrase in text for phrase in vague_phrases)
+
+
+def has_specific_due_date(text):
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        return True
+
+    if re.search(r"\b\d{1,2}/\d{1,2}(/\d{2,4})?\b", text):
+        return True
+
+    return any(
+        re.search(rf"\b{weekday}\b", text)
+        for weekday in [
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+        ]
+    )
+
+
+def due_date_from_weekday(text, today_date):
+    text = normalize_name(text)
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+
+    for weekday_name, weekday_index in weekdays.items():
+        if not re.search(rf"\b(by|on|before|this|next)?\s*{weekday_name}\b", text):
+            continue
+
+        days_until = (weekday_index - today_date.weekday()) % 7
+
+        if "next" in text and days_until == 0:
+            days_until = 7
+
+        return (today_date + timedelta(days=days_until)).isoformat()
+
+    return ""
+
+
+def remove_evidence_from_description(description, evidence):
+    description = clean_text(description)
+    evidence = clean_text(evidence)
+
+    if not description:
+        return ""
+
+    lines = [
+        line.strip()
+        for line in description.splitlines()
+        if line.strip() and not line.strip().lower().startswith("evidence:")
+    ]
+    description = "\n".join(lines).strip()
+
+    if evidence and evidence in description:
+        description = description.replace(evidence, "").strip()
+        description = re.sub(r"\s+", " ", description).strip(" :-")
+
+    return description
+
+
+def clean_thread_analysis(analysis, today_date):
+    cleaned = {
+        "summary": clean_text(analysis.get("summary", "")),
+        "decisions": clean_items(analysis.get("decisions", []), "decision"),
+        "action_items": clean_items(analysis.get("action_items", []), "task"),
+        "blockers": clean_items(analysis.get("blockers", []), "blocker"),
+        "unresolved_questions": clean_items(
+            analysis.get("unresolved_questions", []),
+            "question",
+        ),
+        "proposed_issues": clean_items(analysis.get("proposed_issues", []), "title"),
+    }
+
+    for item in cleaned["action_items"]:
+        item["due_date"] = clean_due_date(
+            item.get("due_date", ""),
+            item.get("evidence", ""),
+            today_date,
+        )
+
+    for item in cleaned["proposed_issues"]:
+        item["due_date"] = clean_due_date(
+            item.get("due_date", ""),
+            item.get("evidence", ""),
+            today_date,
+        )
+        item["description"] = remove_evidence_from_description(
+            item.get("description", ""),
+            item.get("evidence", ""),
+        )
+
+    return cleaned
 
 
 def apply_first_person_fallback(raw_text, assignee_name):
@@ -779,6 +934,7 @@ def pasted_conversation_to_messages(conversation_text):
 
 
 def format_thread_analysis_response(analysis):
+    analysis = clean_thread_analysis(analysis, date.today())
     lines = [
         "Thread analysis preview. No Linear issues were created.",
         "",
@@ -799,30 +955,39 @@ def format_thread_analysis_response(analysis):
         ),
     ]
 
-    found_anything = any(items for _, items, _ in sections)
+    sections = [
+        (section_title, items, fields)
+        for section_title, items, fields in sections
+        if items
+    ]
 
-    if not found_anything:
+    if not sections:
         lines.append("Nothing actionable was found in this conversation.")
         return "\n".join(lines)
 
     for section_title, items, fields in sections:
         lines.append(section_title)
 
-        if not items:
-            lines.append("None")
-            lines.append("")
-            continue
-
         for index, item in enumerate(items, start=1):
             primary_field = fields[0]
-            lines.append(f"{index}. {item.get(primary_field, '')}")
+            primary_value = clean_text(item.get(primary_field, ""))
+            lines.append(f"{index}. {primary_value}")
+            displayed_values = {normalize_name(primary_value)}
 
             for field in fields[1:]:
-                value = item.get(field, "")
+                value = clean_text(item.get(field, ""))
 
-                if value:
-                    label = field.replace("_", " ").title()
-                    lines.append(f"   {label}: {value}")
+                if not value:
+                    continue
+
+                normalized_value = normalize_name(value)
+
+                if field == "evidence" and normalized_value in displayed_values:
+                    continue
+
+                label = field.replace("_", " ").title()
+                lines.append(f"   {label}: {value}")
+                displayed_values.add(normalized_value)
 
         lines.append("")
 
