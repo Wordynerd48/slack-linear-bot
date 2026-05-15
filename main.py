@@ -183,19 +183,12 @@ def issue_contains_source_key(existing_issue, source_key):
 
 
 def source_key_issue_match_score(proposed_issue, existing_issue):
+    proposed_title = proposed_issue.get("title", "")
+    existing_title = existing_issue.get("title", "")
+
     return max(
-        similarity(proposed_issue.get("title", ""), existing_issue.get("title", "")),
-        token_overlap_score(
-            " ".join([
-                proposed_issue.get("title", ""),
-                proposed_issue.get("description", ""),
-                proposed_issue.get("evidence", ""),
-            ]),
-            " ".join([
-                existing_issue.get("title", ""),
-                existing_issue.get("description", "") or "",
-            ]),
-        ),
+        similarity(proposed_title, existing_title),
+        token_overlap_score(proposed_title, existing_title),
     )
 
 
@@ -210,13 +203,21 @@ def source_key_existing_issue_match(proposed_issue, existing_issues, source_key)
         if not issue_contains_source_key(existing_issue, source_key):
             continue
 
+        if incompatible_task_types(proposed_issue, existing_issue):
+            logger.info(
+                "Skipped same-source duplicate match because task types differ: proposed='%s' existing='%s'",
+                proposed_issue.get("title", ""),
+                existing_issue.get("title", ""),
+            )
+            continue
+
         score = source_key_issue_match_score(proposed_issue, existing_issue)
 
         if score > best_score:
             best_score = score
             best_issue = existing_issue
 
-    if best_issue and best_score >= 0.45:
+    if best_issue and best_score >= 0.72:
         return best_issue
 
     return None
@@ -480,6 +481,26 @@ def issue_contains_source_url(existing_issue, source_url):
     return source_url in description
 
 
+
+def task_type(text):
+    text = normalize_name(text)
+
+    if re.search(r"\b(test|verify|qa|check|validate)\b", text):
+        return "test"
+
+    if re.search(r"\b(fix|implement|build|update|resolve|repair)\b", text):
+        return "implementation"
+
+    return "other"
+
+
+def incompatible_task_types(proposed_issue, existing_issue):
+    proposed_type = task_type(proposed_issue.get("title", ""))
+    existing_type = task_type(existing_issue.get("title", ""))
+
+    return {proposed_type, existing_type} == {"test", "implementation"}
+
+
 def issue_match_score(proposed_issue, existing_issue):
     proposed_text = " ".join(
         [
@@ -514,9 +535,18 @@ def find_existing_linear_issue_match(proposed_issue, existing_issues, source_url
     best_score = 0
 
     for existing_issue in existing_issues:
+        if source_key and issue_contains_source_key(existing_issue, source_key):
+            continue
+
+        if source_key and source_url and issue_contains_source_url(existing_issue, source_url):
+            continue
+
+        if incompatible_task_types(proposed_issue, existing_issue):
+            continue
+
         score = issue_match_score(proposed_issue, existing_issue)
 
-        if source_url and issue_contains_source_url(existing_issue, source_url):
+        if source_url and not source_key and issue_contains_source_url(existing_issue, source_url):
             score = max(score, 0.75)
 
         if score > best_score:
@@ -671,32 +701,6 @@ def analyze_thread_with_ai(messages):
                     "additionalProperties": False,
                 },
             },
-            "proposed_issues": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "priority": {
-                            "type": "string",
-                            "enum": ["none", "low", "medium", "high", "urgent"],
-                        },
-                        "assignee_name": {"type": "string"},
-                        "due_date": {"type": "string"},
-                        "evidence": {"type": "string"},
-                    },
-                    "required": [
-                        "title",
-                        "description",
-                        "priority",
-                        "assignee_name",
-                        "due_date",
-                        "evidence",
-                    ],
-                    "additionalProperties": False,
-                },
-            },
         },
         "required": [
             "summary",
@@ -704,7 +708,6 @@ def analyze_thread_with_ai(messages):
             "action_items",
             "blockers",
             "unresolved_questions",
-            "proposed_issues",
         ],
         "additionalProperties": False,
     }
@@ -717,22 +720,20 @@ def analyze_thread_with_ai(messages):
                 "content": (
                     "Analyze the Slack thread and extract only information supported by the messages. "
                     "Do not invent facts, owners, deadlines, priorities, decisions, blockers, or questions. "
-                    "If the thread does not contain actionable work, return empty arrays for action_items "
-                    "and proposed_issues. Generate proposed_issues from action_items that are specific enough "
-                    "to track in Linear. Clear tasks like fixing a login redirect bug or testing OAuth edge cases "
-                    "should become proposed Linear issues. Be conservative, but do not leave proposed_issues "
-                    "empty when clear action_items exist. Keep evidence short and specific, using a brief quote "
-                    "or paraphrase. "
+                    "Extract action_items only when someone explicitly commits to doing work, assigns work, "
+                    "or clearly owns the task. Do not add questions to action_items unless a speaker explicitly "
+                    "commits to answering or doing that work. "
+                    "Do not generate Linear issues. The app will create proposed Linear issues from action_items only. "
                     "If a message asks a question and no later message answers it, include it in "
                     "unresolved_questions. For example, an unanswered question like "
-                    "'Do we need this fixed on mobile too?' should be unresolved. "
+                    "'Do we need this fixed on mobile too?' should be unresolved, not an action item. "
                     f"If a due date is relative, infer it using today's date: {today} "
                     f"({today_date.strftime('%A')}). For named weekdays, use today if it matches, "
                     "otherwise use the next matching weekday after today. If a due date is vague, "
                     "such as 'after that,' leave due_date as an empty string. "
                     "Use the message user field as the speaker name. If a speaker uses first-person "
                     "ownership language like 'I can,', 'I will,', 'I\'ll,', 'I should,', or 'I need to,' "
-                    "set assignee_name to that speaker for the corresponding action item and proposed issue. "
+                    "set assignee_name to that speaker for the corresponding action item. "
                     "For example, if Evan says 'I can fix it by Friday,', assignee_name should be 'Evan'. "
                     "If Sarah says 'I\'ll test OAuth edge cases,', assignee_name should be 'Sarah'. "
                     "Use an empty string for missing assignee_name, owner, or due_date. "
@@ -755,13 +756,12 @@ def analyze_thread_with_ai(messages):
     )
 
     analysis = json.loads(response.output_text)
-    analysis = apply_speaker_assignee_inference(analysis, cleaned_messages)
-    analysis["proposed_issues"] = ensure_proposed_issues_for_action_items(
-        analysis.get("action_items", []),
-        analysis.get("proposed_issues", []),
-    )
+    analysis["proposed_issues"] = []
     analysis = apply_speaker_assignee_inference(analysis, cleaned_messages)
     analysis = clean_thread_analysis(analysis, today_date)
+    analysis["proposed_issues"] = build_proposed_issues_from_action_items(
+        analysis.get("action_items", [])
+    )
     logger.info(
         "AI analyzed Slack thread with %s messages, %s action items, and %s proposed issues",
         len(cleaned_messages),
@@ -770,11 +770,70 @@ def analyze_thread_with_ai(messages):
     )
     return analysis
 
+QUESTION_START_PATTERNS = [
+    "should we",
+    "do we",
+    "do we need",
+    "should i",
+    "can we",
+    "could we",
+    "would it",
+]
+
+
+def has_named_commitment(text):
+    return bool(
+        re.search(
+            r"\b[A-Z][a-z]+:\s*(I['’]?ll|I will|I can|I need to|I should|I am going to|I'm going to)\b",
+            text,
+        )
+        or re.search(r"\b[A-Z][a-z]+\s+will\b", text)
+    )
+
+
+def has_explicit_owner_or_commitment(action_item):
+    if clean_text(action_item.get("assignee_name", "")):
+        return True
+
+    evidence = clean_text(action_item.get("evidence", ""))
+
+    return has_first_person_ownership(evidence) or has_named_commitment(evidence)
+
+
+def looks_like_question_task(text, evidence=""):
+    combined = clean_text(" ".join([text or "", evidence or ""]))
+    normalized = normalize_name(combined)
+
+    has_question_shape = "?" in combined or any(
+        normalized.startswith(pattern)
+        or f": {pattern}" in normalized
+        for pattern in QUESTION_START_PATTERNS
+    )
+
+    if not has_question_shape:
+        return False
+
+    return not (
+        has_first_person_ownership(combined)
+        or has_named_commitment(combined)
+        or "assigned to" in normalized
+        or "please" in normalized
+    )
+
 
 def is_trackable_action_item(action_item):
     task = normalize_name(action_item.get("task", ""))
+    evidence = clean_text(action_item.get("evidence", ""))
 
     if not task:
+        return False
+
+    if looks_like_question_task(action_item.get("task", ""), evidence):
+        logger.info("Filtered action item as unresolved question: %s", action_item.get("task", ""))
+        return False
+
+    if not has_explicit_owner_or_commitment(action_item):
+        logger.info("Filtered action item without explicit owner or commitment: %s", action_item.get("task", ""))
         return False
 
     vague_tasks = {
@@ -789,8 +848,58 @@ def is_trackable_action_item(action_item):
     if task in vague_tasks:
         return False
 
-    return len(task.split()) >= 3 or bool(action_item.get("evidence", "").strip())
+    return len(task.split()) >= 3 or bool(evidence.strip())
 
+
+def dedupe_proposed_issues(proposed_issues):
+    deduped = []
+
+    for proposed_issue in proposed_issues or []:
+        title = proposed_issue.get("title", "")
+        normalized_title = normalize_name(title)
+        proposed_type = task_type(title)
+        duplicate_index = None
+
+        for index, existing in enumerate(deduped):
+            existing_title = existing.get("title", "")
+            existing_normalized = normalize_name(existing_title)
+
+            if proposed_type != task_type(existing_title):
+                continue
+
+            is_duplicate = (
+                normalized_title == existing_normalized
+                or normalized_title in existing_normalized
+                or existing_normalized in normalized_title
+                or similarity(title, existing_title) >= 0.84
+            )
+
+            if is_duplicate:
+                duplicate_index = index
+                break
+
+        if duplicate_index is None:
+            deduped.append(proposed_issue)
+            continue
+
+        current = deduped[duplicate_index]
+        current_score = len(current.get("title", "")) + 20 * bool(current.get("assignee_name")) + 20 * bool(current.get("evidence"))
+        proposed_score = len(proposed_issue.get("title", "")) + 20 * bool(proposed_issue.get("assignee_name")) + 20 * bool(proposed_issue.get("evidence"))
+
+        if proposed_score > current_score:
+            deduped[duplicate_index] = proposed_issue
+
+    return deduped
+
+
+def build_proposed_issues_from_action_items(action_items):
+    proposed_issues = [
+        proposed_issue_from_action_item(action_item)
+        for action_item in action_items or []
+        if is_trackable_action_item(action_item)
+    ]
+
+    return dedupe_proposed_issues(proposed_issues)
 
 def proposed_issue_exists(action_item, proposed_issues):
     task = action_item.get("task", "")
@@ -960,16 +1069,6 @@ def apply_speaker_assignee_inference(analysis, messages):
         if inferred_assignee:
             item["assignee_name"] = inferred_assignee
 
-    for item in analysis.get("proposed_issues", []) or []:
-        inferred_assignee = infer_speaker_assignee_for_item(
-            item,
-            messages,
-            ["title", "description", "evidence"],
-        )
-
-        if inferred_assignee:
-            item["assignee_name"] = inferred_assignee
-
     return analysis
 
 
@@ -1008,6 +1107,15 @@ def clean_due_date(value, evidence, today_date):
 
     if weekday_due_date:
         return weekday_due_date
+
+    if value:
+        try:
+            parsed_date = date.fromisoformat(value)
+        except ValueError:
+            return ""
+
+        if parsed_date < today_date and str(parsed_date.year) not in evidence_text:
+            return ""
 
     return value
 
