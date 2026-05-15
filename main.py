@@ -32,6 +32,7 @@ LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
 LINEAR_API_URL = "https://api.linear.app/graphql"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
 PENDING_THREAD_PREVIEWS = {}
+CREATED_THREAD_ISSUES_BY_SOURCE_KEY = {}
 
 
 @app.on_event("startup")
@@ -130,6 +131,95 @@ def fetch_slack_thread(channel_id, thread_ts):
 
     logger.info("Fetched Slack thread with %s messages", len(messages))
     return messages
+
+
+def fallback_slack_thread_url(channel_id, thread_ts):
+    if not channel_id or not thread_ts:
+        return ""
+
+    return f"https://slack.com/app_redirect?channel={channel_id}&message_ts={thread_ts}"
+
+
+def get_slack_thread_permalink(channel_id, thread_ts):
+    if not channel_id or not thread_ts:
+        return ""
+
+    try:
+        data = slack_api_get(
+            "chat.getPermalink",
+            {
+                "channel": channel_id,
+                "message_ts": thread_ts,
+            },
+        )
+        return data.get("permalink") or fallback_slack_thread_url(channel_id, thread_ts)
+    except Exception:
+        logger.warning("Could not fetch Slack thread permalink; using app_redirect fallback")
+        return fallback_slack_thread_url(channel_id, thread_ts)
+
+
+
+
+def normalize_slack_ts(value):
+    return clean_text(value)
+
+
+def build_slack_source_key(channel_id, thread_ts):
+    channel_id = clean_text(channel_id)
+    thread_ts = normalize_slack_ts(thread_ts)
+
+    if not channel_id or not thread_ts:
+        return ""
+
+    return f"slack-thread:{channel_id}:{thread_ts}"
+
+
+def issue_contains_source_key(existing_issue, source_key):
+    if not source_key:
+        return False
+
+    description = existing_issue.get("description") or ""
+    return source_key in description
+
+
+def source_key_issue_match_score(proposed_issue, existing_issue):
+    return max(
+        similarity(proposed_issue.get("title", ""), existing_issue.get("title", "")),
+        token_overlap_score(
+            " ".join([
+                proposed_issue.get("title", ""),
+                proposed_issue.get("description", ""),
+                proposed_issue.get("evidence", ""),
+            ]),
+            " ".join([
+                existing_issue.get("title", ""),
+                existing_issue.get("description", "") or "",
+            ]),
+        ),
+    )
+
+
+def source_key_existing_issue_match(proposed_issue, existing_issues, source_key):
+    if not source_key:
+        return None
+
+    best_issue = None
+    best_score = 0
+
+    for existing_issue in existing_issues or []:
+        if not issue_contains_source_key(existing_issue, source_key):
+            continue
+
+        score = source_key_issue_match_score(proposed_issue, existing_issue)
+
+        if score > best_score:
+            best_score = score
+            best_issue = existing_issue
+
+    if best_issue and best_score >= 0.45:
+        return best_issue
+
+    return None
 
 
 def get_slack_user_email(slack_user_id):
@@ -348,6 +438,133 @@ def create_linear_issue(
 
     logger.info("Creating Linear issue: title='%s', priority='%s', due_date='%s'", title, priority, due_date or "none")
     return linear_graphql(mutation, variables)
+
+
+def get_recent_linear_issues(limit=200):
+    query = """
+    query RecentIssues($teamId: String!, $first: Int!) {
+      issues(
+        first: $first,
+        filter: { team: { id: { eq: $teamId } } }
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          description
+          url
+        }
+      }
+    }
+    """
+
+    try:
+        data = linear_graphql(
+            query,
+            {
+                "teamId": LINEAR_TEAM_ID,
+                "first": limit,
+            },
+        )
+        return data["data"]["issues"]["nodes"]
+    except Exception:
+        logger.exception("Could not fetch recent Linear issues for duplicate matching")
+        return []
+
+
+def issue_contains_source_url(existing_issue, source_url):
+    if not source_url:
+        return False
+
+    description = existing_issue.get("description") or ""
+    return source_url in description
+
+
+def issue_match_score(proposed_issue, existing_issue):
+    proposed_text = " ".join(
+        [
+            proposed_issue.get("title", ""),
+            proposed_issue.get("description", ""),
+        ]
+    )
+    existing_text = " ".join(
+        [
+            existing_issue.get("title", ""),
+            existing_issue.get("description", "") or "",
+        ]
+    )
+
+    return max(
+        similarity(proposed_issue.get("title", ""), existing_issue.get("title", "")),
+        token_overlap_score(proposed_text, existing_text),
+    )
+
+
+def find_existing_linear_issue_match(proposed_issue, existing_issues, source_url="", source_key=""):
+    source_key_match = source_key_existing_issue_match(
+        proposed_issue,
+        existing_issues,
+        source_key,
+    )
+
+    if source_key_match:
+        return source_key_match
+
+    best_issue = None
+    best_score = 0
+
+    for existing_issue in existing_issues:
+        score = issue_match_score(proposed_issue, existing_issue)
+
+        if source_url and issue_contains_source_url(existing_issue, source_url):
+            score = max(score, 0.75)
+
+        if score > best_score:
+            best_score = score
+            best_issue = existing_issue
+
+    if best_issue and best_score >= 0.78:
+        return best_issue
+
+    return None
+
+def mark_existing_issue_match(proposed_issue, match):
+    proposed_issue["existing_issue_match"] = (
+        f"{match['identifier']}: {match['title']}\n  {match['url']}"
+    )
+    proposed_issue["existing_issue_url"] = match.get("url", "")
+
+
+def annotate_existing_linear_matches(analysis, source_url="", source_key=""):
+    proposed_issues = analysis.get("proposed_issues", []) or []
+
+    if not proposed_issues:
+        return analysis
+
+    existing_issues = get_recent_linear_issues()
+
+    if not existing_issues:
+        return analysis
+
+    for proposed_issue in proposed_issues:
+        match = find_existing_linear_issue_match(
+            proposed_issue,
+            existing_issues,
+            source_url=source_url,
+            source_key=source_key,
+        )
+
+        if match:
+            mark_existing_issue_match(proposed_issue, match)
+            logger.info(
+                "Matched proposed issue '%s' to existing Linear issue %s",
+                proposed_issue.get("title", ""),
+                match.get("identifier", ""),
+            )
+
+    return analysis
+
+
 
 
 def parse_task_with_ai(raw_text):
@@ -1083,7 +1300,7 @@ def pasted_conversation_to_messages(conversation_text):
     return messages
 
 
-def format_thread_analysis_response(analysis):
+def format_thread_analysis_response(analysis, source_url=""):
     analysis = clean_thread_analysis(analysis, date.today())
     lines = [
         "Thread analysis preview. No Linear issues were created.",
@@ -1093,15 +1310,34 @@ def format_thread_analysis_response(analysis):
         "",
     ]
 
+    if source_url:
+        lines.extend(["Source Slack thread", source_url, ""])
+
     sections = [
         ("Decisions", analysis.get("decisions", []), ["decision", "evidence"]),
-        ("Action items", analysis.get("action_items", []), ["task", "assignee_name", "due_date", "priority", "evidence"]),
+        (
+            "Action items",
+            analysis.get("action_items", []),
+            ["task", "assignee_name", "due_date", "priority", "evidence"],
+        ),
         ("Blockers", analysis.get("blockers", []), ["blocker", "owner", "evidence"]),
-        ("Unresolved questions", analysis.get("unresolved_questions", []), ["question", "evidence"]),
+        (
+            "Unresolved questions",
+            analysis.get("unresolved_questions", []),
+            ["question", "evidence"],
+        ),
         (
             "Proposed Linear issues",
             analysis.get("proposed_issues", []),
-            ["title", "description", "priority", "assignee_name", "due_date", "evidence"],
+            [
+                "title",
+                "description",
+                "priority",
+                "assignee_name",
+                "due_date",
+                "existing_issue_match",
+                "evidence",
+            ],
         ),
     ]
 
@@ -1136,12 +1372,46 @@ def format_thread_analysis_response(analysis):
                     continue
 
                 label = field.replace("_", " ").title()
+
+                if field == "existing_issue_match":
+                    label = "Possible Existing Linear Issue"
+
                 lines.append(f"   {label}: {value}")
                 displayed_values.add(normalized_value)
 
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+
+def proposed_issue_has_existing_match(proposed_issue):
+    return bool(proposed_issue.get("existing_issue_match") or proposed_issue.get("existing_issue_url"))
+
+
+def createable_proposed_issues(proposed_issues):
+    return [
+        proposed_issue
+        for proposed_issue in proposed_issues or []
+        if not proposed_issue_has_existing_match(proposed_issue)
+    ]
+
+
+def append_source_context(description, source_url="", source_key="", evidence=""):
+    parts = [clean_text(description)]
+
+    if source_url:
+        parts.extend(["", f"Source Slack thread:\n{source_url}"])
+
+    if source_key:
+        parts.extend(["", f"Slack source key:\n{source_key}"])
+
+    if evidence:
+        parts.extend(["", f"Evidence:\n{evidence}"])
+
+    return "\n".join(part for part in parts if part is not None).strip()
+
+
 
 
 
@@ -1165,7 +1435,7 @@ def build_thread_analysis_blocks(preview_text, preview_id, proposed_issue_count)
                         "type": "button",
                         "text": {
                             "type": "plain_text",
-                            "text": f"Create {proposed_issue_count} Linear issue(s)",
+                            "text": f"Create {proposed_issue_count} new Linear issue(s)",
                         },
                         "style": "primary",
                         "action_id": "create_thread_issues",
@@ -1187,21 +1457,52 @@ def build_thread_analysis_blocks(preview_text, preview_id, proposed_issue_count)
     return blocks
 
 
-def post_thread_analysis_preview(response_url, analysis, requester_slack_user_id=""):
-    message = format_thread_analysis_response(analysis)
+
+def post_thread_analysis_preview(
+    response_url,
+    analysis,
+    requester_slack_user_id="",
+    source_url="",
+    source_key="",
+):
+    message = format_thread_analysis_response(analysis, source_url)
     proposed_issues = analysis.get("proposed_issues", []) or []
+    createable_issues = createable_proposed_issues(proposed_issues)
     preview_id = str(uuid.uuid4())
 
-    if proposed_issues:
+    if source_key and source_key in CREATED_THREAD_ISSUES_BY_SOURCE_KEY:
+        existing_created_issues = CREATED_THREAD_ISSUES_BY_SOURCE_KEY[source_key]
+
+        for proposed_issue in proposed_issues:
+            if proposed_issue_has_existing_match(proposed_issue):
+                continue
+
+            match = find_existing_linear_issue_match(
+                proposed_issue,
+                existing_created_issues,
+                source_url=source_url,
+                source_key=source_key,
+            )
+
+            if match:
+                mark_existing_issue_match(proposed_issue, match)
+
+        createable_issues = createable_proposed_issues(proposed_issues)
+        message = format_thread_analysis_response(analysis, source_url)
+
+    if createable_issues:
         PENDING_THREAD_PREVIEWS[preview_id] = {
             "proposed_issues": proposed_issues,
             "requester_slack_user_id": requester_slack_user_id,
+            "source_url": source_url,
+            "source_key": source_key,
             "created_at": time.time(),
         }
         logger.info(
-            "Stored thread preview %s with %s proposed issues",
+            "Stored thread preview %s with %s proposed issues and %s createable issues",
             preview_id,
             len(proposed_issues),
+            len(createable_issues),
         )
 
     payload = {
@@ -1209,45 +1510,116 @@ def post_thread_analysis_preview(response_url, analysis, requester_slack_user_id
         "text": message,
     }
 
-    if proposed_issues:
+    if createable_issues:
         payload["blocks"] = build_thread_analysis_blocks(
             message,
             preview_id,
-            len(proposed_issues),
+            len(createable_issues),
         )
 
     requests.post(response_url, json=payload, timeout=10)
 
 
+
 def create_linear_issues_from_preview(preview):
     created_issues = []
+    skipped_issues = []
     proposed_issues = preview.get("proposed_issues", []) or []
     requester_slack_user_id = preview.get("requester_slack_user_id", "")
+    source_url = preview.get("source_url", "")
+    source_key = preview.get("source_key", "")
+    existing_issues = get_recent_linear_issues()
+
+    if source_key:
+        existing_issues.extend(CREATED_THREAD_ISSUES_BY_SOURCE_KEY.get(source_key, []))
 
     for proposed_issue in proposed_issues:
+        if proposed_issue_has_existing_match(proposed_issue):
+            skipped_issues.append(proposed_issue)
+            continue
+
+        match = find_existing_linear_issue_match(
+            proposed_issue,
+            existing_issues,
+            source_url=source_url,
+            source_key=source_key,
+        )
+
+        if match:
+            mark_existing_issue_match(proposed_issue, match)
+            skipped_issues.append(proposed_issue)
+            logger.info(
+                "Skipped proposed issue '%s' because it matched existing Linear issue %s",
+                proposed_issue.get("title", ""),
+                match.get("identifier", ""),
+            )
+            continue
+
+        description = append_source_context(
+            proposed_issue.get("description", ""),
+            source_url=source_url,
+            source_key=source_key,
+            evidence=proposed_issue.get("evidence", ""),
+        )
+
         result = create_linear_issue(
             title=proposed_issue.get("title", ""),
-            description=proposed_issue.get("description", ""),
+            description=description,
             priority=proposed_issue.get("priority", "none"),
             assignee_name=proposed_issue.get("assignee_name", ""),
             due_date=proposed_issue.get("due_date", ""),
             requester_slack_user_id=requester_slack_user_id,
         )
-        created_issues.append(result["data"]["issueCreate"]["issue"])
+        issue = result["data"]["issueCreate"]["issue"]
+        created_issues.append(issue)
 
-    return created_issues
+        existing_issue_record = {
+            "id": issue.get("id", ""),
+            "identifier": issue.get("identifier", ""),
+            "title": issue.get("title", ""),
+            "description": description,
+            "url": issue.get("url", ""),
+        }
+        existing_issues.append(existing_issue_record)
+
+        if source_key:
+            CREATED_THREAD_ISSUES_BY_SOURCE_KEY.setdefault(source_key, []).append(
+                existing_issue_record
+            )
+
+    return created_issues, skipped_issues
 
 
-def format_created_thread_issues_response(created_issues):
-    if not created_issues:
+
+def format_created_thread_issues_response(created_issues, skipped_issues=None, source_url=""):
+    skipped_issues = skipped_issues or []
+
+    if not created_issues and not skipped_issues:
         return "No Linear issues were created."
 
-    lines = ["Created Linear issues from this thread:"]
+    lines = []
 
-    for issue in created_issues:
-        lines.append(f"• {issue['identifier']}: {issue['title']}\n  {issue['url']}")
+    if created_issues:
+        lines.append(f"Created {len(created_issues)} Linear issue(s) from this thread:")
+
+        for issue in created_issues:
+            lines.append(f"• {issue['identifier']}: {issue['title']}\n  {issue['url']}")
+
+    if skipped_issues:
+        if lines:
+            lines.append("")
+
+        lines.append("Skipped possible duplicate issue(s):")
+
+        for proposed_issue in skipped_issues:
+            existing_match = proposed_issue.get("existing_issue_match", "existing Linear issue")
+            lines.append(f"• {proposed_issue.get('title', 'Untitled issue')}\n  Possible match: {existing_match}")
+
+    if source_url:
+        lines.extend(["", f"Source Slack thread:\n{source_url}"])
 
     return "\n".join(lines)
+
 
 
 def process_create_thread_issues_and_respond(preview_id, response_url):
@@ -1265,8 +1637,12 @@ def process_create_thread_issues_and_respond(preview_id, response_url):
             )
             return
 
-        created_issues = create_linear_issues_from_preview(preview)
-        message = format_created_thread_issues_response(created_issues)
+        created_issues, skipped_issues = create_linear_issues_from_preview(preview)
+        message = format_created_thread_issues_response(
+            created_issues,
+            skipped_issues,
+            preview.get("source_url", ""),
+        )
 
         requests.post(
             response_url,
@@ -1288,6 +1664,8 @@ def process_create_thread_issues_and_respond(preview_id, response_url):
             },
             timeout=10,
         )
+
+
 
 def process_analyze_text_and_respond(conversation_text, response_url):
     try:
@@ -1320,7 +1698,20 @@ def process_analyze_thread_and_respond(channel_id, thread_ts, response_url, requ
     try:
         messages = fetch_slack_thread(channel_id, thread_ts)
         analysis = analyze_thread_with_ai(messages)
-        post_thread_analysis_preview(response_url, analysis, requester_slack_user_id)
+        source_url = get_slack_thread_permalink(channel_id, thread_ts)
+        source_key = build_slack_source_key(channel_id, thread_ts)
+        analysis = annotate_existing_linear_matches(
+            analysis,
+            source_url=source_url,
+            source_key=source_key,
+        )
+        post_thread_analysis_preview(
+            response_url,
+            analysis,
+            requester_slack_user_id,
+            source_url,
+            source_key,
+        )
     except Exception:
         logger.exception("Error processing Slack thread analysis")
 
@@ -1332,6 +1723,7 @@ def process_analyze_thread_and_respond(channel_id, thread_ts, response_url, requ
             },
             timeout=10,
         )
+
 
 
 def process_ai_task_and_respond(raw_text, response_url, slack_user_id, preview=False):
