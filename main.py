@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 
@@ -30,6 +31,7 @@ LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
 LINEAR_API_URL = "https://api.linear.app/graphql"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
+PENDING_THREAD_PREVIEWS = {}
 
 
 @app.on_event("startup")
@@ -1142,6 +1144,151 @@ def format_thread_analysis_response(analysis):
     return "\n".join(lines).strip()
 
 
+
+def build_thread_analysis_blocks(preview_text, preview_id, proposed_issue_count):
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"```{preview_text}```",
+            },
+        }
+    ]
+
+    if proposed_issue_count > 0:
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": f"Create {proposed_issue_count} Linear issue(s)",
+                        },
+                        "style": "primary",
+                        "action_id": "create_thread_issues",
+                        "value": preview_id,
+                    },
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Cancel",
+                        },
+                        "action_id": "cancel_thread_issues",
+                        "value": preview_id,
+                    },
+                ],
+            }
+        )
+
+    return blocks
+
+
+def post_thread_analysis_preview(response_url, analysis, requester_slack_user_id=""):
+    message = format_thread_analysis_response(analysis)
+    proposed_issues = analysis.get("proposed_issues", []) or []
+    preview_id = str(uuid.uuid4())
+
+    if proposed_issues:
+        PENDING_THREAD_PREVIEWS[preview_id] = {
+            "proposed_issues": proposed_issues,
+            "requester_slack_user_id": requester_slack_user_id,
+            "created_at": time.time(),
+        }
+        logger.info(
+            "Stored thread preview %s with %s proposed issues",
+            preview_id,
+            len(proposed_issues),
+        )
+
+    payload = {
+        "response_type": "ephemeral",
+        "text": message,
+    }
+
+    if proposed_issues:
+        payload["blocks"] = build_thread_analysis_blocks(
+            message,
+            preview_id,
+            len(proposed_issues),
+        )
+
+    requests.post(response_url, json=payload, timeout=10)
+
+
+def create_linear_issues_from_preview(preview):
+    created_issues = []
+    proposed_issues = preview.get("proposed_issues", []) or []
+    requester_slack_user_id = preview.get("requester_slack_user_id", "")
+
+    for proposed_issue in proposed_issues:
+        result = create_linear_issue(
+            title=proposed_issue.get("title", ""),
+            description=proposed_issue.get("description", ""),
+            priority=proposed_issue.get("priority", "none"),
+            assignee_name=proposed_issue.get("assignee_name", ""),
+            due_date=proposed_issue.get("due_date", ""),
+            requester_slack_user_id=requester_slack_user_id,
+        )
+        created_issues.append(result["data"]["issueCreate"]["issue"])
+
+    return created_issues
+
+
+def format_created_thread_issues_response(created_issues):
+    if not created_issues:
+        return "No Linear issues were created."
+
+    lines = ["Created Linear issues from this thread:"]
+
+    for issue in created_issues:
+        lines.append(f"• {issue['identifier']}: {issue['title']}\n  {issue['url']}")
+
+    return "\n".join(lines)
+
+
+def process_create_thread_issues_and_respond(preview_id, response_url):
+    try:
+        preview = PENDING_THREAD_PREVIEWS.pop(preview_id, None)
+
+        if not preview:
+            requests.post(
+                response_url,
+                json={
+                    "response_type": "ephemeral",
+                    "text": "This thread preview expired or was already used. Please analyze the thread again.",
+                },
+                timeout=10,
+            )
+            return
+
+        created_issues = create_linear_issues_from_preview(preview)
+        message = format_created_thread_issues_response(created_issues)
+
+        requests.post(
+            response_url,
+            json={
+                "response_type": "ephemeral",
+                "text": message,
+            },
+            timeout=10,
+        )
+
+    except Exception:
+        logger.exception("Error creating Linear issues from thread preview")
+
+        requests.post(
+            response_url,
+            json={
+                "response_type": "ephemeral",
+                "text": "Couldn’t create Linear issues from this thread. Check the FastAPI terminal for details.",
+            },
+            timeout=10,
+        )
+
 def process_analyze_text_and_respond(conversation_text, response_url):
     try:
         messages = pasted_conversation_to_messages(conversation_text)
@@ -1169,20 +1316,11 @@ def process_analyze_text_and_respond(conversation_text, response_url):
         )
 
 
-def process_analyze_thread_and_respond(channel_id, thread_ts, response_url):
+def process_analyze_thread_and_respond(channel_id, thread_ts, response_url, requester_slack_user_id=""):
     try:
         messages = fetch_slack_thread(channel_id, thread_ts)
         analysis = analyze_thread_with_ai(messages)
-        message = format_thread_analysis_response(analysis)
-
-        requests.post(
-            response_url,
-            json={
-                "response_type": "ephemeral",
-                "text": message,
-            },
-            timeout=10,
-        )
+        post_thread_analysis_preview(response_url, analysis, requester_slack_user_id)
     except Exception:
         logger.exception("Error processing Slack thread analysis")
 
@@ -1292,6 +1430,43 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
     interaction_type = payload.get("type")
     callback_id = payload.get("callback_id")
+    response_url = payload.get("response_url")
+
+    if interaction_type == "block_actions":
+        actions = payload.get("actions", [])
+        action = actions[0] if actions else {}
+        action_id = action.get("action_id")
+        preview_id = action.get("value")
+
+        if action_id == "cancel_thread_issues":
+            PENDING_THREAD_PREVIEWS.pop(preview_id, None)
+            return {
+                "response_type": "ephemeral",
+                "text": "Cancelled. No Linear issues were created.",
+            }
+
+        if action_id == "create_thread_issues":
+            if not preview_id or not response_url:
+                return {
+                    "response_type": "ephemeral",
+                    "text": "Couldn’t find the saved thread preview.",
+                }
+
+            background_tasks.add_task(
+                process_create_thread_issues_and_respond,
+                preview_id,
+                response_url,
+            )
+
+            return {
+                "response_type": "ephemeral",
+                "text": "Creating Linear issues from the thread preview...",
+            }
+
+        return {
+            "response_type": "ephemeral",
+            "text": "Unsupported Slack button action.",
+        }
 
     if interaction_type != "message_action" or callback_id != "analyze_thread_for_linear":
         return {
@@ -1301,10 +1476,11 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
 
     channel = payload.get("channel", {})
     message = payload.get("message", {})
-    response_url = payload.get("response_url")
+    user = payload.get("user", {})
 
     channel_id = channel.get("id")
     thread_ts = message.get("thread_ts") or message.get("ts")
+    requester_slack_user_id = user.get("id", "")
 
     if not channel_id or not thread_ts or not response_url:
         logger.warning(
@@ -1323,6 +1499,7 @@ async def slack_interactive(request: Request, background_tasks: BackgroundTasks)
         channel_id,
         thread_ts,
         response_url,
+        requester_slack_user_id,
     )
 
     return {
@@ -1390,6 +1567,7 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
             channel_id,
             thread_ts,
             response_url,
+            slack_user_id,
         )
 
         return {
