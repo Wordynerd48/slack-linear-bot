@@ -655,6 +655,126 @@ def detected_item_to_dashboard_dict(item):
     return result
 
 
+def parse_database_timestamp(value):
+    value = clean_text(value)
+
+    if not value:
+        return None
+
+    for timestamp_format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"]:
+        try:
+            return datetime.strptime(value, timestamp_format)
+        except ValueError:
+            continue
+
+    return None
+
+
+def hours_since_timestamp(value):
+    timestamp = parse_database_timestamp(value)
+
+    if not timestamp:
+        return 0
+
+    return max(0, (datetime.now() - timestamp).total_seconds() / 3600)
+
+
+def due_date_within_days(value, days):
+    value = clean_text(value)
+
+    if not value:
+        return False
+
+    try:
+        parsed_due_date = date.fromisoformat(value)
+    except ValueError:
+        return False
+
+    today = date.today()
+    return today <= parsed_due_date <= today + timedelta(days=days)
+
+
+def risk_item_primary_field(item_type):
+    if item_type == "unresolved_question":
+        return "question"
+
+    if item_type == "blocker":
+        return "blocker"
+
+    if item_type == "action_item":
+        return "task"
+
+    return "title"
+
+
+def get_dashboard_risks(limit=50):
+    init_database()
+
+    with get_database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                detected_items.*,
+                thread_analyses.source_url AS source_url,
+                thread_analyses.summary AS analysis_summary
+            FROM detected_items
+            JOIN thread_analyses ON thread_analyses.id = detected_items.analysis_id
+            WHERE detected_items.status = 'new'
+              AND detected_items.item_type IN ('proposed_issue', 'unresolved_question', 'blocker')
+            ORDER BY detected_items.created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    risks = []
+
+    for row in rows:
+        item_type = row["item_type"]
+        reasons = []
+        age_hours = hours_since_timestamp(row["created_at"])
+        priority = normalize_name(row["priority"] or "")
+
+        if item_type == "proposed_issue":
+            if age_hours >= 24:
+                reasons.append("Untracked action item older than 24 hours")
+
+            if priority in {"high", "urgent"}:
+                reasons.append("High-priority item has not been created or matched")
+
+            if due_date_within_days(row["due_date"], 2):
+                reasons.append("Due within 2 days and not yet tracked")
+
+        elif item_type == "unresolved_question":
+            if age_hours >= 48:
+                reasons.append("Unresolved question older than 48 hours")
+
+        elif item_type == "blocker":
+            reasons.append("Blocker still needs review")
+
+        if not reasons:
+            continue
+
+        item = detected_item_to_dashboard_dict(row)
+        primary_field = risk_item_primary_field(item_type)
+
+        risks.append(
+            {
+                "id": row["id"],
+                "item_type": item_type,
+                "title": item.get(primary_field, row["title"]),
+                "primary_field": primary_field,
+                "reasons": reasons,
+                "source_url": row["source_url"] or "",
+                "analysis_summary": row["analysis_summary"] or "",
+                "created_at": row["created_at"] or "",
+                "item": item,
+            }
+        )
+
+    return risks
+
+
 def require_env_vars():
     required_vars = {
         "SLACK_SIGNING_SECRET": SLACK_SIGNING_SECRET,
@@ -2105,8 +2225,70 @@ def render_item_list(items, primary_field):
     return "".join(parts)
 
 
+def render_dashboard_risks(risks):
+    if not risks:
+        return """
+            <section class="risk-section">
+                <div class="risk-header">
+                    <div>
+                        <h2>Risks</h2>
+                        <p class="meta">No current risks based on saved dashboard items.</p>
+                    </div>
+                    <span class="badge muted-badge">0 active</span>
+                </div>
+            </section>
+        """
+
+    cards = []
+
+    for risk in risks:
+        source_url = risk.get("source_url", "")
+        source_link = (
+            f'<a href="{html_escape(source_url)}" target="_blank" rel="noreferrer">Open Slack thread</a>'
+            if source_url else '<span class="muted">No source URL</span>'
+        )
+        item = risk.get("item", {})
+        reasons = "".join(
+            f'<li>{html_escape(reason)}</li>'
+            for reason in risk.get("reasons", [])
+        )
+        summary = html_escape(risk.get("analysis_summary", ""))
+        summary_line = f'<p class="risk-summary">{summary}</p>' if summary else ""
+
+        cards.append(f"""
+            <article class="risk-card">
+                <div class="risk-card-main">
+                    <div>
+                        <h3>{html_escape(risk.get('title', 'Untitled risk'))}</h3>
+                        <p class="meta">{html_escape(risk.get('created_at', ''))} · {source_link}</p>
+                        {summary_line}
+                        <ul class="risk-reasons">{reasons}</ul>
+                    </div>
+                    {render_ignore_button(item)}
+                </div>
+            </article>
+        """)
+
+    return f"""
+        <section class="risk-section">
+            <div class="risk-header">
+                <div>
+                    <h2>Risks</h2>
+                    <p class="meta">Items that may fall through the cracks based on saved Slack analyses.</p>
+                </div>
+                <span class="badge risk-badge">{len(risks)} active</span>
+            </div>
+            <div class="risk-grid">
+                {''.join(cards)}
+            </div>
+        </section>
+    """
+
+
 def render_dashboard_html():
     cards = []
+    risks = get_dashboard_risks()
+    risk_html = render_dashboard_risks(risks)
 
     for entry in get_recent_thread_analyses(MAX_ANALYSIS_HISTORY):
         source_url = entry.get("source_url", "")
@@ -2177,6 +2359,16 @@ def render_dashboard_html():
             .meta, .muted {{ color: #6b7280; }}
             .meta {{ margin: 6px 0 0; font-size: 14px; }}
             .badge {{ white-space: nowrap; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 6px 10px; font-size: 13px; font-weight: 600; }}
+            .muted-badge {{ background: #f3f4f6; color: #6b7280; }}
+            .risk-badge {{ background: #fef3c7; color: #92400e; }}
+            .risk-section {{ background: #fff7ed; border: 1px solid #fed7aa; border-radius: 18px; padding: 22px; margin-bottom: 24px; }}
+            .risk-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 14px; }}
+            .risk-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
+            .risk-card {{ background: white; border: 1px solid #fed7aa; border-radius: 14px; padding: 16px; }}
+            .risk-card h3 {{ margin-top: 0; text-transform: none; letter-spacing: 0; font-size: 16px; color: #1f2937; }}
+            .risk-card-main {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }}
+            .risk-summary {{ margin: 8px 0; color: #4b5563; font-size: 14px; }}
+            .risk-reasons {{ margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 14px; }}
             .item-title {{ display: flex; align-items: center; gap: 10px; justify-content: space-between; }}
             .inline-form {{ display: inline; margin: 0; }}
             .ignore-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 3px 8px; font-size: 12px; cursor: pointer; }}
@@ -2188,7 +2380,7 @@ def render_dashboard_html():
             a {{ color: #2563eb; text-decoration: none; }}
             a:hover {{ text-decoration: underline; }}
             .empty {{ text-align: center; padding: 48px; }}
-            @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .grid {{ grid-template-columns: 1fr; }} .card-header {{ flex-direction: column; }} }}
+            @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .grid, .risk-grid {{ grid-template-columns: 1fr; }} .card-header, .risk-header {{ flex-direction: column; }} }}
         </style>
     </head>
     <body>
@@ -2197,6 +2389,7 @@ def render_dashboard_html():
             <p class="meta">Saved Slack thread analyses from SQLite. Refresh after running the Slack shortcut.</p>
         </header>
         <main>
+            {risk_html}
             {''.join(cards)}
         </main>
     </body>
