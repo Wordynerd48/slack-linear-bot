@@ -452,3 +452,212 @@ def test_blocker_creates_risk_until_ignored(temp_database):
     main.ignore_related_detected_items(blocker["id"])
 
     assert "Waiting on production API credentials" not in risk_titles_and_reasons()
+
+def call_mark_tracked(item_id):
+    """Support the current helper name, with a fallback if we rename it later."""
+    if hasattr(main, "mark_related_detected_items_tracked"):
+        return main.mark_related_detected_items_tracked(item_id)
+
+    if hasattr(main, "mark_detected_item_tracked"):
+        return main.mark_detected_item_tracked(item_id)
+
+    raise AssertionError("No mark-tracked helper found in main.py")
+
+
+def call_snooze(item_id, hours=24):
+    """Support the current helper name, with a fallback if we rename it later."""
+    if hasattr(main, "snooze_related_detected_items"):
+        return main.snooze_related_detected_items(item_id, hours=hours)
+
+    if hasattr(main, "snooze_detected_item"):
+        return main.snooze_detected_item(item_id, hours=hours)
+
+    raise AssertionError("No snooze helper found in main.py")
+
+
+def test_mark_tracked_action_item_also_marks_paired_proposed_issue(temp_database):
+    source_key = "slack-thread:C123:mark-tracked-pair"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    action_item = item_by_type_and_title(source_key, "action_item", "fix checkout")
+    call_mark_tracked(action_item["id"])
+
+    rows = get_items_for_source(source_key)
+    fix_rows = [
+        row for row in rows
+        if "fix checkout" in row["title"].lower()
+    ]
+
+    assert {row["item_type"] for row in fix_rows} == {"action_item", "proposed_issue"}
+    assert all(row["status"] == "matched" for row in fix_rows)
+
+
+def test_mark_tracked_proposed_issue_is_not_createable(temp_database):
+    source_key = "slack-thread:C123:mark-tracked-createable"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_mark_tracked(proposed_issue["id"])
+
+    reanalysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", reanalysis)
+
+    fix_proposed = [
+        item for item in reanalysis["proposed_issues"]
+        if "fix checkout" in item["title"].lower()
+    ][0]
+
+    assert fix_proposed["status"] == "matched"
+    assert main.proposed_issue_has_existing_match(fix_proposed) is True
+    assert fix_proposed not in main.createable_proposed_issues(reanalysis["proposed_issues"])
+
+
+def test_mark_tracked_removes_item_from_risks(temp_database):
+    source_key = "slack-thread:C123:mark-tracked-risk"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "urgent"
+    analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    assert "fix checkout page shipping method persistence" in risk_titles_and_reasons()
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_mark_tracked(proposed_issue["id"])
+
+    assert "fix checkout page shipping method persistence" not in risk_titles_and_reasons()
+
+
+def test_mark_tracked_status_survives_reanalysis(temp_database):
+    source_key = "slack-thread:C123:mark-tracked-preserve"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_mark_tracked(proposed_issue["id"])
+
+    reanalysis = saved_analysis(source_key)
+    reanalysis["proposed_issues"][0]["title"] = "fix checkout shipping method persistence issue"
+    reanalysis["action_items"][0]["task"] = "fix checkout shipping method persistence issue"
+
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", reanalysis)
+
+    rows = get_items_for_source(source_key)
+    fix_rows = [
+        row for row in rows
+        if row["item_type"] in {"action_item", "proposed_issue"}
+        and "fix checkout" in row["title"].lower()
+    ]
+
+    assert fix_rows
+    assert all(row["status"] == "matched" for row in fix_rows)
+
+
+def test_snooze_sets_snoozed_until_on_item_and_pair(temp_database):
+    source_key = "slack-thread:C123:snooze-pair"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    action_item = item_by_type_and_title(source_key, "action_item", "fix checkout")
+    call_snooze(action_item["id"], hours=24)
+
+    rows = get_items_for_source(source_key)
+    fix_rows = [
+        row for row in rows
+        if "fix checkout" in row["title"].lower()
+    ]
+
+    assert {row["item_type"] for row in fix_rows} == {"action_item", "proposed_issue"}
+    assert all(row["snoozed_until"] for row in fix_rows)
+
+
+def test_snoozed_proposed_issue_is_temporarily_not_createable(temp_database):
+    source_key = "slack-thread:C123:snooze-createable"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_snooze(proposed_issue["id"], hours=24)
+
+    reanalysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", reanalysis)
+
+    fix_proposed = [
+        item for item in reanalysis["proposed_issues"]
+        if "fix checkout" in item["title"].lower()
+    ][0]
+
+    assert fix_proposed.get("snoozed_until")
+    assert main.proposed_issue_has_existing_match(fix_proposed) is True
+    assert fix_proposed not in main.createable_proposed_issues(reanalysis["proposed_issues"])
+
+
+def test_snoozed_item_does_not_show_in_risks_until_expired(temp_database):
+    source_key = "slack-thread:C123:snooze-risk"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "urgent"
+    analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    assert "fix checkout page shipping method persistence" in risk_titles_and_reasons()
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_snooze(proposed_issue["id"], hours=24)
+
+    assert "fix checkout page shipping method persistence" not in risk_titles_and_reasons()
+
+
+def test_expired_snooze_allows_risk_to_return(temp_database):
+    source_key = "slack-thread:C123:snooze-expired"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "urgent"
+    analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_snooze(proposed_issue["id"], hours=24)
+
+    expired_time = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with main.get_database_connection() as connection:
+        connection.execute(
+            """
+            UPDATE detected_items
+            SET snoozed_until = ?
+            WHERE id = ?
+            """,
+            (expired_time, proposed_issue["id"]),
+        )
+        connection.commit()
+
+    risks = risk_titles_and_reasons()
+    assert "fix checkout page shipping method persistence" in risks
+
+
+def test_snooze_status_survives_reanalysis(temp_database):
+    source_key = "slack-thread:C123:snooze-preserve"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_snooze(proposed_issue["id"], hours=24)
+
+    reanalysis = saved_analysis(source_key)
+    reanalysis["proposed_issues"][0]["title"] = "fix checkout shipping method persistence issue"
+    reanalysis["action_items"][0]["task"] = "fix checkout shipping method persistence issue"
+
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", reanalysis)
+
+    rows = get_items_for_source(source_key)
+    fix_rows = [
+        row for row in rows
+        if row["item_type"] in {"action_item", "proposed_issue"}
+        and "fix checkout" in row["title"].lower()
+    ]
+
+    assert fix_rows
+    assert all(row["snoozed_until"] for row in fix_rows)
