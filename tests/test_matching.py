@@ -732,7 +732,7 @@ def test_scan_channel_analyzes_new_thread_and_saves_result(temp_database, monkey
             }
         ]
 
-    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
         assert channel_id_arg == channel_id
         assert thread_ts_arg == thread_ts
         analysis = saved_analysis(source_key)
@@ -768,6 +768,7 @@ def test_scan_channel_skips_existing_thread(temp_database, monkeypatch):
         source_key,
         "https://example.slack.com/thread",
         saved_analysis(source_key),
+        scan_metadata={"last_seen_reply_ts": thread_ts, "reply_count": 2},
     )
 
     analyze_calls = []
@@ -784,7 +785,7 @@ def test_scan_channel_skips_existing_thread(temp_database, monkeypatch):
         ],
     )
 
-    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
         analyze_calls.append((channel_id_arg, thread_ts_arg))
 
     monkeypatch.setattr(main, "analyze_and_save_thread_from_channel_scan", fake_analyze_and_save_thread_from_channel_scan)
@@ -820,7 +821,7 @@ def test_scan_channel_counts_failed_thread_without_stopping(temp_database, monke
         ],
     )
 
-    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
         if thread_ts_arg == "111.000":
             raise RuntimeError("fake scan failure")
 
@@ -976,7 +977,7 @@ def test_force_rescan_existing_thread_updates_without_duplicate_card(temp_databa
         ],
     )
 
-    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
         calls.append((channel_id_arg, thread_ts_arg))
         updated = saved_analysis(source_key)
         updated["summary"] = "Updated checkout summary after force rescan."
@@ -1112,3 +1113,374 @@ def test_recent_thread_analyses_ignored_filter_includes_ignored_items(temp_datab
 
     questions = [item.get("question", "") for item in entry["unresolved_questions"]]
     assert "Should we also test guest checkout separately?" in questions
+
+
+
+def test_save_thread_analysis_stores_scan_metadata(temp_database):
+    source_key = "slack-thread:C123:freshness-store"
+    metadata = {
+        "last_seen_reply_ts": "111.999",
+        "reply_count": 4,
+        "last_scanned_at": "2026-05-16 12:00:00",
+    }
+
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+        scan_metadata=metadata,
+    )
+
+    stored = main.get_thread_scan_metadata(source_key)
+
+    assert stored["last_seen_reply_ts"] == "111.999"
+    assert stored["reply_count"] == 4
+    assert stored["last_scanned_at"] == "2026-05-16 12:00:00"
+
+
+def test_normal_scan_skips_unchanged_existing_thread_with_metadata(temp_database, monkeypatch):
+    channel_id = "C123"
+    thread_ts = "111.000"
+    source_key = main.build_slack_source_key(channel_id, thread_ts)
+    metadata = {"last_seen_reply_ts": "111.500", "reply_count": 2}
+
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+        scan_metadata=metadata,
+    )
+
+    analyze_calls = []
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": thread_ts,
+                "latest_reply": "111.500",
+                "reply_count": 2,
+                "text": "Existing unchanged parent",
+            }
+        ],
+    )
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
+        analyze_calls.append((channel_id_arg, thread_ts_arg, scan_metadata))
+        return True
+
+    monkeypatch.setattr(
+        main,
+        "analyze_and_save_thread_from_channel_scan",
+        fake_analyze_and_save_thread_from_channel_scan,
+    )
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=24)
+
+    assert result == {
+        "threads_found": 1,
+        "analyzed": 0,
+        "skipped_existing": 1,
+        "failed": 0,
+    }
+    assert analyze_calls == []
+
+
+def test_normal_scan_rescans_existing_thread_when_reply_metadata_changes(temp_database, monkeypatch):
+    channel_id = "C123"
+    thread_ts = "111.000"
+    source_key = main.build_slack_source_key(channel_id, thread_ts)
+
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+        scan_metadata={"last_seen_reply_ts": "111.100", "reply_count": 1},
+    )
+
+    captured_metadata = []
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": thread_ts,
+                "latest_reply": "111.900",
+                "reply_count": 2,
+                "text": "Changed parent",
+            }
+        ],
+    )
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
+        captured_metadata.append(scan_metadata)
+        updated = saved_analysis(source_key)
+        updated["summary"] = "Updated because Slack reply metadata changed."
+        main.save_thread_analysis(
+            source_key,
+            "https://example.slack.com/thread",
+            updated,
+            scan_metadata=scan_metadata,
+        )
+        return True
+
+    monkeypatch.setattr(
+        main,
+        "analyze_and_save_thread_from_channel_scan",
+        fake_analyze_and_save_thread_from_channel_scan,
+    )
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=24)
+
+    assert result == {
+        "threads_found": 1,
+        "analyzed": 1,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+    assert captured_metadata[0]["last_seen_reply_ts"] == "111.900"
+    assert captured_metadata[0]["reply_count"] == 2
+
+    stored = main.get_thread_scan_metadata(source_key)
+    assert stored["last_seen_reply_ts"] == "111.900"
+    assert stored["reply_count"] == 2
+
+
+def test_force_rescan_rescans_unchanged_existing_thread(temp_database, monkeypatch):
+    channel_id = "C123"
+    thread_ts = "111.000"
+    source_key = main.build_slack_source_key(channel_id, thread_ts)
+
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+        scan_metadata={"last_seen_reply_ts": "111.500", "reply_count": 2},
+    )
+
+    analyze_calls = []
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": thread_ts,
+                "latest_reply": "111.500",
+                "reply_count": 2,
+                "text": "Existing unchanged parent",
+            }
+        ],
+    )
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
+        analyze_calls.append((channel_id_arg, thread_ts_arg, scan_metadata))
+        main.save_thread_analysis(
+            source_key,
+            "https://example.slack.com/thread",
+            saved_analysis(source_key),
+            scan_metadata=scan_metadata,
+        )
+        return True
+
+    monkeypatch.setattr(
+        main,
+        "analyze_and_save_thread_from_channel_scan",
+        fake_analyze_and_save_thread_from_channel_scan,
+    )
+
+    result = main.scan_slack_channel_for_threads(
+        channel_id,
+        lookback_hours=24,
+        force_rescan=True,
+    )
+
+    assert result == {
+        "threads_found": 1,
+        "analyzed": 1,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+    assert len(analyze_calls) == 1
+
+
+def test_linear_reference_parts_extracts_identifier_and_url():
+    identifier, url = main.linear_reference_parts(
+        "https://linear.app/example/issue/FLO-123/fix-checkout"
+    )
+
+    assert identifier == "FLO-123"
+    assert url == "https://linear.app/example/issue/FLO-123/fix-checkout"
+
+    identifier, url = main.linear_reference_parts("flo-456")
+
+    assert identifier == "FLO-456"
+    assert url == ""
+
+
+def test_mark_tracked_with_linear_id_saves_reference_on_item_and_pair(temp_database):
+    source_key = "slack-thread:C123:mark-tracked-linear-id"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    action_item = item_by_type_and_title(source_key, "action_item", "fix checkout")
+    main.mark_related_detected_items_tracked(action_item["id"], linear_reference="FLO-123")
+
+    rows = get_items_for_source(source_key)
+    fix_rows = [row for row in rows if "fix checkout" in row["title"].lower()]
+
+    assert {row["item_type"] for row in fix_rows} == {"action_item", "proposed_issue"}
+    assert all(row["status"] == "matched" for row in fix_rows)
+    assert all(row["linear_identifier"] == "FLO-123" for row in fix_rows)
+    assert all(row["existing_issue_match"] == "FLO-123" for row in fix_rows)
+    assert all(row["existing_issue_match_type"] == "manually_tracked" for row in fix_rows)
+
+
+def test_mark_tracked_with_linear_url_saves_url_and_survives_reanalysis(temp_database):
+    source_key = "slack-thread:C123:mark-tracked-linear-url"
+    linear_url = "https://linear.app/example/issue/FLO-789/fix-checkout"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference=linear_url)
+
+    reanalysis = saved_analysis(source_key)
+    reanalysis["proposed_issues"][0]["title"] = "fix checkout shipping method persistence issue"
+    reanalysis["action_items"][0]["task"] = "fix checkout shipping method persistence issue"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", reanalysis)
+
+    rows = get_items_for_source(source_key)
+    fix_rows = [
+        row for row in rows
+        if row["item_type"] in {"action_item", "proposed_issue"}
+        and "fix checkout" in row["title"].lower()
+    ]
+
+    assert fix_rows
+    assert all(row["status"] == "matched" for row in fix_rows)
+    assert all(row["linear_identifier"] == "FLO-789" for row in fix_rows)
+    assert all(row["linear_url"] == linear_url for row in fix_rows)
+
+
+def test_dashboard_renders_mark_tracked_reference_form(temp_database):
+    source_key = "slack-thread:C123:render-reference-form"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    html = main.render_dashboard_html()
+
+    assert 'name="linear_reference"' in html
+    assert "FLO-123 or Linear URL" in html
+    assert "Mark tracked" in html
+
+
+def test_dashboard_renders_clean_layout_containers(temp_database):
+    html = main.render_dashboard_html()
+
+    assert "dashboard-layout" in html
+    assert "dashboard-sidebar" in html
+    assert "dashboard-content" in html
+
+
+def test_dashboard_renders_scan_freshness_metadata(temp_database):
+    source_key = "slack-thread:C123:freshness-render"
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+        scan_metadata={"last_seen_reply_ts": "111.555", "reply_count": 3},
+    )
+
+    entry = next(
+        entry for entry in main.get_recent_thread_analyses()
+        if entry["source_key"] == source_key
+    )
+
+    assert entry["last_seen_reply_ts"] == "111.555"
+    assert entry["reply_count"] == 3
+    assert entry["last_scanned_at"]
+
+
+def test_evidence_asked_if_is_unanswered_question():
+    assert main.evidence_is_unanswered_question(
+        "Alex asked if they should also test backup code settings."
+    ) is True
+
+
+def test_action_item_from_asked_if_evidence_is_not_trackable():
+    action_item = {
+        "task": "Test backup code settings.",
+        "assignee_name": "Alex",
+        "due_date": "",
+        "priority": "none",
+        "evidence": "Alex asked if they should also test backup code settings.",
+    }
+
+    assert main.is_trackable_action_item(action_item) is False
+
+
+def test_clean_thread_analysis_moves_question_evidence_action_to_unresolved_question():
+    analysis = {
+        "summary": "Alex raised a question about backup code settings.",
+        "decisions": [],
+        "action_items": [
+            {
+                "task": "Test backup code settings.",
+                "assignee_name": "Alex",
+                "due_date": "",
+                "priority": "none",
+                "evidence": "Alex asked if they should also test backup code settings.",
+            }
+        ],
+        "blockers": [],
+        "unresolved_questions": [],
+        "proposed_issues": [],
+    }
+
+    cleaned = main.clean_thread_analysis(analysis, date.today())
+    cleaned["proposed_issues"] = main.build_proposed_issues_from_action_items(
+        cleaned["action_items"]
+    )
+
+    assert cleaned["action_items"] == []
+    assert cleaned["proposed_issues"] == []
+    assert cleaned["unresolved_questions"] == [
+        {
+            "question": "Should we also test backup code settings?",
+            "evidence": "Alex asked if they should also test backup code settings.",
+        }
+    ]
+
+
+def test_question_evidence_action_does_not_create_proposed_issue_when_saved(temp_database):
+    source_key = "slack-thread:C123:asked-if-question"
+    analysis = {
+        "summary": "Alex asked if backup code settings should be tested.",
+        "decisions": [],
+        "action_items": [
+            {
+                "task": "Test backup code settings.",
+                "assignee_name": "Alex",
+                "due_date": "",
+                "priority": "none",
+                "evidence": "Alex asked if they should also test backup code settings.",
+            }
+        ],
+        "blockers": [],
+        "unresolved_questions": [],
+        "proposed_issues": [],
+    }
+
+    cleaned = main.clean_thread_analysis(analysis, date.today())
+    cleaned["proposed_issues"] = main.build_proposed_issues_from_action_items(
+        cleaned["action_items"]
+    )
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", cleaned)
+
+    rows = get_items_for_source(source_key)
+
+    assert [row["item_type"] for row in rows] == ["unresolved_question"]
+    assert rows[0]["title"] == "Should we also test backup code settings?"

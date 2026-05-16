@@ -66,11 +66,28 @@ def init_database():
                 source_key TEXT UNIQUE NOT NULL,
                 source_url TEXT,
                 summary TEXT,
+                last_seen_reply_ts TEXT,
+                reply_count INTEGER,
+                last_scanned_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        existing_thread_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(thread_analyses)").fetchall()
+        }
+
+        if "last_seen_reply_ts" not in existing_thread_columns:
+            connection.execute("ALTER TABLE thread_analyses ADD COLUMN last_seen_reply_ts TEXT")
+
+        if "reply_count" not in existing_thread_columns:
+            connection.execute("ALTER TABLE thread_analyses ADD COLUMN reply_count INTEGER")
+
+        if "last_scanned_at" not in existing_thread_columns:
+            connection.execute("ALTER TABLE thread_analyses ADD COLUMN last_scanned_at TEXT")
+
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS detected_items (
@@ -121,6 +138,9 @@ def init_database():
 
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_analyses_updated_at ON thread_analyses(updated_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thread_analyses_source_key ON thread_analyses(source_key)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_detected_items_analysis_id ON detected_items(analysis_id)"
@@ -300,10 +320,22 @@ def previous_related_item_state_for(previous_state, item_type, title):
 
     return None
 
-def save_thread_analysis(source_key, source_url, analysis):
+def save_thread_analysis(source_key, source_url, analysis, scan_metadata=None):
     source_key = database_source_key(source_key)
     now = current_timestamp()
     summary = clean_text(analysis.get("summary", ""))
+    scan_metadata = scan_metadata or {}
+    last_seen_reply_ts = clean_text(scan_metadata.get("last_seen_reply_ts", ""))
+    raw_reply_count = scan_metadata.get("reply_count", None)
+    reply_count = None
+
+    if raw_reply_count not in {None, ""}:
+        try:
+            reply_count = int(raw_reply_count)
+        except (TypeError, ValueError):
+            reply_count = None
+
+    last_scanned_at = clean_text(scan_metadata.get("last_scanned_at", "")) or now
 
     with get_database_connection() as connection:
         existing = connection.execute(
@@ -319,10 +351,14 @@ def save_thread_analysis(source_key, source_url, analysis):
             connection.execute(
                 """
                 UPDATE thread_analyses
-                SET source_url = ?, summary = ?, updated_at = ?
+                SET source_url = ?, summary = ?,
+                    last_seen_reply_ts = COALESCE(NULLIF(?, ''), last_seen_reply_ts),
+                    reply_count = COALESCE(?, reply_count),
+                    last_scanned_at = ?,
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (source_url, summary, now, analysis_id),
+                (source_url, summary, last_seen_reply_ts, reply_count, last_scanned_at, now, analysis_id),
             )
             connection.execute(
                 "DELETE FROM detected_items WHERE analysis_id = ?",
@@ -331,10 +367,13 @@ def save_thread_analysis(source_key, source_url, analysis):
         else:
             cursor = connection.execute(
                 """
-                INSERT INTO thread_analyses (source_key, source_url, summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO thread_analyses (
+                    source_key, source_url, summary, last_seen_reply_ts,
+                    reply_count, last_scanned_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (source_key, source_url, summary, now, now),
+                (source_key, source_url, summary, last_seen_reply_ts, reply_count, last_scanned_at, now, now),
             )
             analysis_id = cursor.lastrowid
 
@@ -457,6 +496,29 @@ def linear_identifier_from_match(existing_match):
     existing_match = clean_text(existing_match)
     match = re.match(r"([A-Z]+-\d+):", existing_match)
     return match.group(1) if match else ""
+
+
+def linear_reference_parts(value):
+    value = clean_text(value)
+
+    if not value:
+        return "", ""
+
+    identifier_match = re.search(r"\b([A-Z][A-Z0-9]+-\d+)\b", value, re.IGNORECASE)
+    identifier = identifier_match.group(1).upper() if identifier_match else ""
+    url = value if re.match(r"https?://", value, re.IGNORECASE) else ""
+
+    return identifier, url
+
+
+def linear_display_from_reference(identifier, url):
+    identifier = clean_text(identifier)
+    url = clean_text(url)
+
+    if identifier and url:
+        return f"{identifier}\n  {url}"
+
+    return identifier or url
 
 
 def mark_detected_item_created(detected_item_id, issue):
@@ -639,8 +701,10 @@ def matching_related_detected_items(connection, selected, related_types):
     return matches
 
 
-def mark_related_detected_items_tracked(item_id):
+def mark_related_detected_items_tracked(item_id, linear_reference=""):
     now = current_timestamp()
+    linear_identifier, linear_url = linear_reference_parts(linear_reference)
+    existing_issue_match = linear_display_from_reference(linear_identifier, linear_url)
 
     with get_database_connection() as connection:
         selected = connection.execute(
@@ -654,10 +718,23 @@ def mark_related_detected_items_tracked(item_id):
         connection.execute(
             """
             UPDATE detected_items
-            SET status = 'matched', snoozed_until = '', updated_at = ?
+            SET status = 'matched',
+                linear_identifier = COALESCE(NULLIF(?, ''), linear_identifier),
+                linear_url = COALESCE(NULLIF(?, ''), linear_url),
+                existing_issue_match = COALESCE(NULLIF(?, ''), existing_issue_match),
+                existing_issue_match_type = COALESCE(NULLIF(?, ''), existing_issue_match_type),
+                snoozed_until = '',
+                updated_at = ?
             WHERE id = ?
             """,
-            (now, item_id),
+            (
+                linear_identifier,
+                linear_url,
+                existing_issue_match,
+                "manually_tracked" if existing_issue_match else "",
+                now,
+                item_id,
+            ),
         )
 
         selected_type = selected["item_type"]
@@ -673,15 +750,29 @@ def mark_related_detected_items_tracked(item_id):
             connection.execute(
                 """
                 UPDATE detected_items
-                SET status = 'matched', snoozed_until = '', updated_at = ?
+                SET status = 'matched',
+                    linear_identifier = COALESCE(NULLIF(?, ''), linear_identifier),
+                    linear_url = COALESCE(NULLIF(?, ''), linear_url),
+                    existing_issue_match = COALESCE(NULLIF(?, ''), existing_issue_match),
+                    existing_issue_match_type = COALESCE(NULLIF(?, ''), existing_issue_match_type),
+                    snoozed_until = '',
+                    updated_at = ?
                 WHERE id = ?
                 """,
-                (now, candidate["id"]),
+                (
+                    linear_identifier,
+                    linear_url,
+                    existing_issue_match,
+                    "manually_tracked" if existing_issue_match else "",
+                    now,
+                    candidate["id"],
+                ),
             )
             logger.info(
-                "Marked related dashboard item tracked: selected='%s' related='%s'",
+                "Marked related dashboard item tracked: selected='%s' related='%s' reference='%s'",
                 selected["title"] or "",
                 candidate["title"] or "",
+                existing_issue_match,
             )
 
         connection.commit()
@@ -749,7 +840,8 @@ def get_recent_thread_analyses(limit=20, item_filter="all"):
     with get_database_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, source_key, source_url, summary, created_at, updated_at
+            SELECT id, source_key, source_url, summary, last_seen_reply_ts,
+                   reply_count, last_scanned_at, created_at, updated_at
             FROM thread_analyses
             ORDER BY updated_at DESC
             LIMIT ?
@@ -774,6 +866,9 @@ def get_recent_thread_analyses(limit=20, item_filter="all"):
                 "source_key": row["source_key"],
                 "source_url": row["source_url"],
                 "summary": row["summary"],
+                "last_seen_reply_ts": row["last_seen_reply_ts"],
+                "reply_count": row["reply_count"],
+                "last_scanned_at": row["last_scanned_at"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
                 "action_items": [],
@@ -1090,6 +1185,67 @@ def source_key_exists(source_key):
     return row is not None
 
 
+def get_thread_scan_metadata(source_key):
+    source_key = clean_text(source_key)
+
+    if not source_key:
+        return None
+
+    init_database()
+
+    with get_database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT last_seen_reply_ts, reply_count, last_scanned_at
+            FROM thread_analyses
+            WHERE source_key = ?
+            """,
+            (source_key,),
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def slack_thread_parent_metadata(parent):
+    latest_reply = clean_text(
+        parent.get("latest_reply", "")
+        or parent.get("thread_ts", "")
+        or parent.get("ts", "")
+    )
+
+    try:
+        reply_count = int(parent.get("reply_count") or 0)
+    except (TypeError, ValueError):
+        reply_count = 0
+
+    return {
+        "last_seen_reply_ts": latest_reply,
+        "reply_count": reply_count,
+        "last_scanned_at": current_timestamp(),
+    }
+
+
+def thread_scan_metadata_changed(previous_metadata, current_metadata):
+    if not previous_metadata:
+        return True
+
+    previous_reply_ts = clean_text(previous_metadata.get("last_seen_reply_ts", ""))
+    current_reply_ts = clean_text(current_metadata.get("last_seen_reply_ts", ""))
+    previous_reply_count = previous_metadata.get("reply_count")
+    current_reply_count = current_metadata.get("reply_count")
+
+    if previous_reply_ts and current_reply_ts and previous_reply_ts != current_reply_ts:
+        return True
+
+    if previous_reply_count is not None and current_reply_count is not None:
+        try:
+            return int(previous_reply_count) != int(current_reply_count)
+        except (TypeError, ValueError):
+            return True
+
+    return True
+
+
 def save_channel_scan_history(channel_id, lookback_hours, force_rescan, result):
     init_database()
     now = current_timestamp()
@@ -1186,7 +1342,7 @@ def channel_thread_parent_messages(messages):
     return parents
 
 
-def analyze_and_save_thread_from_channel_scan(channel_id, thread_ts):
+def analyze_and_save_thread_from_channel_scan(channel_id, thread_ts, scan_metadata=None):
     messages = fetch_slack_thread(channel_id, thread_ts)
 
     if not messages:
@@ -1200,7 +1356,7 @@ def analyze_and_save_thread_from_channel_scan(channel_id, thread_ts):
         source_url=source_url,
         source_key=source_key,
     )
-    save_thread_analysis(source_key, source_url, analysis)
+    save_thread_analysis(source_key, source_url, analysis, scan_metadata=scan_metadata)
     return True
 
 
@@ -1231,13 +1387,20 @@ def scan_slack_channel_for_threads(channel_id, lookback_hours=24, force_rescan=F
     for parent in thread_parents:
         thread_ts = parent.get("thread_ts") or parent.get("ts")
         source_key = build_slack_source_key(channel_id, thread_ts)
+        current_metadata = slack_thread_parent_metadata(parent)
+        previous_metadata = get_thread_scan_metadata(source_key)
 
-        if source_key_exists(source_key) and not force_rescan:
-            skipped_existing_count += 1
-            continue
+        if previous_metadata and not force_rescan:
+            if not thread_scan_metadata_changed(previous_metadata, current_metadata):
+                skipped_existing_count += 1
+                continue
 
         try:
-            if analyze_and_save_thread_from_channel_scan(channel_id, thread_ts):
+            if analyze_and_save_thread_from_channel_scan(
+                channel_id,
+                thread_ts,
+                scan_metadata=current_metadata,
+            ):
                 analyzed_count += 1
         except Exception:
             failed_count += 1
@@ -1992,11 +2155,101 @@ def looks_like_question_task(text, evidence=""):
     )
 
 
+def evidence_is_unanswered_question(evidence):
+    evidence = clean_text(evidence)
+    normalized = normalize_name(evidence)
+
+    if not normalized:
+        return False
+
+    question_phrases = [
+        "asked if",
+        "asked whether",
+        "asks if",
+        "asks whether",
+        "wondered if",
+        "wondered whether",
+        "raised whether",
+        "raised the question whether",
+        "questioned whether",
+        "wanted to know if",
+        "wants to know if",
+        "whether we should",
+        "whether they should",
+        "if we should",
+        "if they should",
+    ]
+
+    has_question_evidence = any(phrase in normalized for phrase in question_phrases)
+
+    if not has_question_evidence:
+        return False
+
+    return not (
+        has_first_person_ownership(evidence)
+        or has_named_commitment(evidence)
+        or "assigned to" in normalized
+        or "will test" in normalized
+        or "will fix" in normalized
+    )
+
+
+def title_as_question_from_action_task(task):
+    task = clean_text(task).strip(" .")
+
+    if not task:
+        return ""
+
+    lowered_task = task[:1].lower() + task[1:]
+    return f"Should we {lowered_task}?"
+
+
+def unresolved_question_from_action_item(action_item):
+    task = clean_text(action_item.get("task", ""))
+    evidence = clean_text(action_item.get("evidence", ""))
+    question = ""
+
+    if "?" in evidence:
+        question_sentences = re.findall(r"([^.!?]*\?)", evidence)
+        if question_sentences:
+            question = clean_text(question_sentences[-1])
+            question = re.sub(r"^[A-Za-z][A-Za-z\s]*:\s*", "", question).strip()
+
+    if not question:
+        match = re.search(
+            r"\basked\s+(?:if|whether)\s+(?:we|they|the team)\s+should\s+(.+?)[\.?!]*$",
+            evidence,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            question = f"Should we {clean_text(match.group(1)).strip(' .?')}?"
+
+    if not question:
+        match = re.search(
+            r"\bwondered\s+(?:if|whether)\s+(?:we|they|the team)\s+should\s+(.+?)[\.?!]*$",
+            evidence,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            question = f"Should we {clean_text(match.group(1)).strip(' .?')}?"
+
+    if not question:
+        question = title_as_question_from_action_task(task)
+
+    return {
+        "question": question,
+        "evidence": evidence,
+    }
+
 def is_trackable_action_item(action_item):
     task = normalize_name(action_item.get("task", ""))
     evidence = clean_text(action_item.get("evidence", ""))
 
     if not task:
+        return False
+
+    if evidence_is_unanswered_question(evidence):
+        logger.info("Filtered action item because evidence is an unanswered question: %s", action_item.get("task", ""))
         return False
 
     if looks_like_question_task(action_item.get("task", ""), evidence):
@@ -2388,12 +2641,36 @@ def clean_thread_analysis(analysis, today_date):
         "proposed_issues": clean_items(analysis.get("proposed_issues", []), "title"),
     }
 
+    kept_action_items = []
+    existing_questions = {
+        normalize_name(item.get("question", ""))
+        for item in cleaned["unresolved_questions"]
+    }
+
     for item in cleaned["action_items"]:
         item["due_date"] = clean_due_date(
             item.get("due_date", ""),
             item.get("evidence", ""),
             today_date,
         )
+
+        if evidence_is_unanswered_question(item.get("evidence", "")):
+            question_item = unresolved_question_from_action_item(item)
+            normalized_question = normalize_name(question_item.get("question", ""))
+
+            if normalized_question and normalized_question not in existing_questions:
+                cleaned["unresolved_questions"].append(question_item)
+                existing_questions.add(normalized_question)
+
+            logger.info(
+                "Moved action item to unresolved question because evidence is a question: %s",
+                item.get("task", ""),
+            )
+            continue
+
+        kept_action_items.append(item)
+
+    cleaned["action_items"] = kept_action_items
 
     for item in cleaned["proposed_issues"]:
         item["due_date"] = clean_due_date(
@@ -2652,7 +2929,8 @@ def render_mark_tracked_button(item):
         return ""
 
     return f"""
-        <form class="inline-form" method="post" action="/dashboard/items/{html_escape(item_id)}/mark-tracked">
+        <form class="inline-form track-form" method="post" action="/dashboard/items/{html_escape(item_id)}/mark-tracked">
+            <input class="linear-reference-input" type="text" name="linear_reference" placeholder="FLO-123 or Linear URL" aria-label="Linear issue reference">
             <button type="submit" class="track-button">Mark tracked</button>
         </form>
     """
@@ -2931,7 +3209,10 @@ def render_dashboard_html(scan_result="", item_filter="all"):
             h2 {{ margin: 0; font-size: 18px; }}
             h3 {{ margin: 18px 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #4b5563; }}
             main {{ padding: 24px 36px 48px; max-width: 1100px; }}
-            .scan-section {{ background: white; border: 1px solid #dbeafe; border-radius: 18px; padding: 22px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
+            .dashboard-layout {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 22px; align-items: start; }}
+            .dashboard-sidebar {{ position: sticky; top: 18px; display: flex; flex-direction: column; gap: 16px; }}
+            .dashboard-content {{ min-width: 0; }}
+            .scan-section {{ background: white; border: 1px solid #dbeafe; border-radius: 18px; padding: 22px; margin-bottom: 0; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
             .scan-form {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-top: 14px; }}
             .scan-form label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
             .scan-form input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; min-width: 170px; font-size: 14px; }}
@@ -2943,7 +3224,7 @@ def render_dashboard_html(scan_result="", item_filter="all"):
             .filter-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
             .filter-link {{ border: 1px solid #d1d5db; background: white; color: #374151; border-radius: 999px; padding: 7px 11px; font-size: 14px; }}
             .active-filter {{ border-color: #2563eb; background: #eff6ff; color: #1d4ed8; font-weight: 600; }}
-            .scan-history-section {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 18px 22px; margin-bottom: 24px; }}
+            .scan-history-section {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 18px 22px; margin-bottom: 0; }}
             .scan-history-list {{ margin: 10px 0 0; padding-left: 20px; color: #4b5563; font-size: 14px; }}
             .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
             .card-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }}
@@ -2963,7 +3244,9 @@ def render_dashboard_html(scan_result="", item_filter="all"):
             .risk-reasons {{ margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 14px; }}
             .item-title {{ display: flex; align-items: center; gap: 10px; justify-content: space-between; }}
             .inline-form {{ display: inline; margin: 0; }}
-            .item-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }}
+            .item-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }}
+            .track-form {{ display: inline-flex; gap: 6px; align-items: center; }}
+            .linear-reference-input {{ border: 1px solid #d1d5db; border-radius: 999px; padding: 3px 8px; font-size: 12px; width: 150px; }}
             .ignore-button, .track-button, .snooze-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 3px 8px; font-size: 12px; cursor: pointer; }}
             .ignore-button:hover, .track-button:hover, .snooze-button:hover {{ background: #f3f4f6; color: #111827; }}
             .track-button {{ border-color: #bfdbfe; color: #1d4ed8; }}
@@ -2975,6 +3258,7 @@ def render_dashboard_html(scan_result="", item_filter="all"):
             a {{ color: #2563eb; text-decoration: none; }}
             a:hover {{ text-decoration: underline; }}
             .empty {{ text-align: center; padding: 48px; }}
+            @media (max-width: 1000px) {{ .dashboard-layout {{ grid-template-columns: 1fr; }} .dashboard-sidebar {{ position: static; }} }}
             @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .grid, .risk-grid {{ grid-template-columns: 1fr; }} .card-header, .risk-header {{ flex-direction: column; }} }}
         </style>
     </head>
@@ -2984,11 +3268,17 @@ def render_dashboard_html(scan_result="", item_filter="all"):
             <p class="meta">Saved Slack thread analyses from SQLite. Refresh after running the Slack shortcut.</p>
         </header>
         <main>
-            {render_scan_channel_form(scan_result)}
-            {scan_history_html}
-            {filter_tabs_html}
-            {risk_html}
-            {''.join(cards)}
+            <div class="dashboard-layout">
+                <aside class="dashboard-sidebar">
+                    {render_scan_channel_form(scan_result)}
+                    {scan_history_html}
+                </aside>
+                <section class="dashboard-content">
+                    {filter_tabs_html}
+                    {risk_html}
+                    {''.join(cards)}
+                </section>
+            </div>
         </main>
     </body>
     </html>
@@ -3281,8 +3571,10 @@ def ignore_dashboard_item(item_id: int):
 
 
 @app.post("/dashboard/items/{item_id}/mark-tracked")
-def mark_dashboard_item_tracked(item_id: int):
-    mark_related_detected_items_tracked(item_id)
+async def mark_dashboard_item_tracked(item_id: int, request: Request):
+    form = await request.form()
+    linear_reference = clean_text(form.get("linear_reference", ""))
+    mark_related_detected_items_tracked(item_id, linear_reference=linear_reference)
     return Response(status_code=303, headers={"Location": "/dashboard"})
 
 
