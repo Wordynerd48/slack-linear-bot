@@ -196,7 +196,8 @@ def previous_item_state_for(previous_state, item_type, title):
             best_score = score
             best_state = old_state
 
-    if best_state and best_score >= 0.82:
+    threshold = 0.72 if item_type == "unresolved_question" else 0.82
+    if best_state and best_score >= threshold:
         logger.info(
             "Preserved prior status for re-analyzed item: type=%s title='%s' old_title='%s' score=%.2f",
             item_type,
