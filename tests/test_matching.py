@@ -910,3 +910,205 @@ def test_dashboard_scan_form_is_rendered():
     assert 'name="channel_id"' in html
     assert 'name="lookback_hours"' in html
     assert "Scan channel" in html
+
+def test_scan_history_is_saved_after_scan(temp_database, monkeypatch):
+    channel_id = "C123"
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [],
+    )
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=12)
+
+    assert result == {
+        "threads_found": 0,
+        "analyzed": 0,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+
+    history = main.get_recent_channel_scan_history()
+    assert len(history) == 1
+    assert history[0]["channel_id"] == channel_id
+    assert history[0]["lookback_hours"] == 12
+    assert history[0]["force_rescan"] == 0
+
+
+def test_dashboard_renders_scan_history(temp_database, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [],
+    )
+
+    main.scan_slack_channel_for_threads("C123", lookback_hours=24)
+    html = main.render_dashboard_html()
+
+    assert "Recent scans" in html
+    assert "C123" in html
+    assert "found 0" in html
+
+
+def test_force_rescan_existing_thread_updates_without_duplicate_card(temp_database, monkeypatch):
+    channel_id = "C123"
+    thread_ts = "111.000"
+    source_key = main.build_slack_source_key(channel_id, thread_ts)
+
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+    )
+
+    calls = []
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": thread_ts,
+                "text": "Parent",
+                "reply_count": 2,
+            }
+        ],
+    )
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+        calls.append((channel_id_arg, thread_ts_arg))
+        updated = saved_analysis(source_key)
+        updated["summary"] = "Updated checkout summary after force rescan."
+        main.save_thread_analysis(
+            source_key,
+            "https://example.slack.com/thread",
+            updated,
+        )
+        return True
+
+    monkeypatch.setattr(
+        main,
+        "analyze_and_save_thread_from_channel_scan",
+        fake_analyze_and_save_thread_from_channel_scan,
+    )
+
+    result = main.scan_slack_channel_for_threads(
+        channel_id,
+        lookback_hours=24,
+        force_rescan=True,
+    )
+
+    assert result == {
+        "threads_found": 1,
+        "analyzed": 1,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+    assert calls == [(channel_id, thread_ts)]
+
+    with main.get_database_connection() as connection:
+        rows = connection.execute(
+            "SELECT source_key, summary FROM thread_analyses WHERE source_key = ?",
+            (source_key,),
+        ).fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "Updated checkout summary after force rescan."
+
+
+def test_force_rescan_is_recorded_in_scan_history(temp_database, monkeypatch):
+    channel_id = "C123"
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [],
+    )
+
+    main.scan_slack_channel_for_threads(channel_id, lookback_hours=24, force_rescan=True)
+
+    history = main.get_recent_channel_scan_history()
+    assert history[0]["force_rescan"] == 1
+
+
+def test_dashboard_filter_tabs_are_rendered(temp_database):
+    html = main.render_dashboard_html(item_filter="tracked")
+
+    assert 'href="/dashboard?filter=all"' in html
+    assert 'href="/dashboard?filter=risks"' in html
+    assert 'href="/dashboard?filter=new"' in html
+    assert 'href="/dashboard?filter=tracked"' in html
+    assert 'href="/dashboard?filter=snoozed"' in html
+    assert 'href="/dashboard?filter=ignored"' in html
+    assert "active-filter" in html
+
+
+def test_dashboard_scan_form_includes_force_rescan_checkbox(temp_database):
+    html = main.render_dashboard_html()
+
+    assert 'name="force_rescan"' in html
+    assert "Force rescan existing threads" in html
+
+
+def test_recent_thread_analyses_new_filter_excludes_tracked_ignored_and_snoozed(temp_database):
+    source_key = "slack-thread:C123:filter-new"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    fix_proposed = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    test_proposed = item_by_type_and_title(source_key, "proposed_issue", "test shipping")
+    question = item_by_type_and_title(source_key, "unresolved_question", "guest checkout")
+
+    call_mark_tracked(fix_proposed["id"])
+    call_snooze(test_proposed["id"], hours=24)
+    main.ignore_related_detected_items(question["id"])
+
+    entries = main.get_recent_thread_analyses(item_filter="new")
+
+    assert all(entry["source_key"] != source_key for entry in entries)
+
+
+def test_recent_thread_analyses_tracked_filter_includes_matched_items(temp_database):
+    source_key = "slack-thread:C123:filter-tracked"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    fix_proposed = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    call_mark_tracked(fix_proposed["id"])
+
+    entries = main.get_recent_thread_analyses(item_filter="tracked")
+    entry = next(entry for entry in entries if entry["source_key"] == source_key)
+
+    titles = [item.get("title", "") for item in entry["proposed_issues"]]
+    assert "fix checkout page shipping method persistence" in titles
+
+
+def test_recent_thread_analyses_snoozed_filter_includes_snoozed_items(temp_database):
+    source_key = "slack-thread:C123:filter-snoozed"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    test_proposed = item_by_type_and_title(source_key, "proposed_issue", "test shipping")
+    call_snooze(test_proposed["id"], hours=24)
+
+    entries = main.get_recent_thread_analyses(item_filter="snoozed")
+    entry = next(entry for entry in entries if entry["source_key"] == source_key)
+
+    titles = [item.get("title", "") for item in entry["proposed_issues"]]
+    assert "test shipping method persistence after Evan's fix" in titles
+
+
+def test_recent_thread_analyses_ignored_filter_includes_ignored_items(temp_database):
+    source_key = "slack-thread:C123:filter-ignored"
+    analysis = saved_analysis(source_key)
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    question = item_by_type_and_title(source_key, "unresolved_question", "guest checkout")
+    main.ignore_related_detected_items(question["id"])
+
+    entries = main.get_recent_thread_analyses(item_filter="ignored")
+    entry = next(entry for entry in entries if entry["source_key"] == source_key)
+
+    questions = [item.get("question", "") for item in entry["unresolved_questions"]]
+    assert "Should we also test guest checkout separately?" in questions

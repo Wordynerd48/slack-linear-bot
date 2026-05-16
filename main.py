@@ -104,10 +104,29 @@ def init_database():
             connection.execute("ALTER TABLE detected_items ADD COLUMN snoozed_until TEXT")
 
         connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_scan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                lookback_hours INTEGER NOT NULL,
+                force_rescan INTEGER NOT NULL DEFAULT 0,
+                threads_found INTEGER NOT NULL DEFAULT 0,
+                analyzed INTEGER NOT NULL DEFAULT 0,
+                skipped_existing INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_analyses_updated_at ON thread_analyses(updated_at DESC)"
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_detected_items_analysis_id ON detected_items(analysis_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_scan_history_created_at ON channel_scan_history(created_at DESC)"
         )
         connection.commit()
 
@@ -723,8 +742,9 @@ def is_future_timestamp(value):
     timestamp = parse_database_timestamp(value)
     return bool(timestamp and timestamp > datetime.now())
 
-def get_recent_thread_analyses(limit=20):
+def get_recent_thread_analyses(limit=20, item_filter="all"):
     init_database()
+    item_filter = normalize_dashboard_filter(item_filter)
 
     with get_database_connection() as connection:
         rows = connection.execute(
@@ -763,7 +783,7 @@ def get_recent_thread_analyses(limit=20):
             }
 
             for item in item_rows:
-                if item["status"] == "ignored":
+                if not detected_item_matches_dashboard_filter(item, item_filter):
                     continue
 
                 item_dict = detected_item_to_dashboard_dict(item)
@@ -777,6 +797,19 @@ def get_recent_thread_analyses(limit=20):
                     entry["blockers"].append(item_dict)
                 elif item_type == "proposed_issue":
                     entry["proposed_issues"].append(item_dict)
+
+            has_visible_items = any(
+                entry[key]
+                for key in [
+                    "action_items",
+                    "unresolved_questions",
+                    "blockers",
+                    "proposed_issues",
+                ]
+            )
+
+            if item_filter != "all" and not has_visible_items:
+                continue
 
             proposed_issues = entry["proposed_issues"]
             entry["createable_count"] = sum(
@@ -1057,6 +1090,80 @@ def source_key_exists(source_key):
     return row is not None
 
 
+def save_channel_scan_history(channel_id, lookback_hours, force_rescan, result):
+    init_database()
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO channel_scan_history (
+                channel_id, lookback_hours, force_rescan, threads_found,
+                analyzed, skipped_existing, failed, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clean_text(channel_id),
+                int(lookback_hours or 24),
+                1 if force_rescan else 0,
+                int(result.get("threads_found", 0)),
+                int(result.get("analyzed", 0)),
+                int(result.get("skipped_existing", 0)),
+                int(result.get("failed", 0)),
+                now,
+            ),
+        )
+        connection.commit()
+
+
+def get_recent_channel_scan_history(limit=5):
+    init_database()
+
+    with get_database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT channel_id, lookback_hours, force_rescan, threads_found,
+                   analyzed, skipped_existing, failed, created_at
+            FROM channel_scan_history
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def normalize_dashboard_filter(value):
+    value = normalize_name(value)
+    allowed_filters = {"all", "risks", "new", "tracked", "snoozed", "ignored"}
+    return value if value in allowed_filters else "all"
+
+
+def detected_item_matches_dashboard_filter(item, item_filter):
+    item_filter = normalize_dashboard_filter(item_filter)
+    status = clean_text(item["status"] or "new")
+    snoozed = is_future_timestamp(item["snoozed_until"] or "")
+
+    if item_filter in {"all", "risks"}:
+        return status != "ignored"
+
+    if item_filter == "new":
+        return status == "new" and not snoozed
+
+    if item_filter == "tracked":
+        return status in {"created", "matched", "possible_duplicate"}
+
+    if item_filter == "snoozed":
+        return snoozed and status not in {"ignored", "created", "matched"}
+
+    if item_filter == "ignored":
+        return status == "ignored"
+
+    return status != "ignored"
+
+
 def channel_thread_parent_messages(messages):
     parents = []
     seen_thread_ts = set()
@@ -1097,7 +1204,7 @@ def analyze_and_save_thread_from_channel_scan(channel_id, thread_ts):
     return True
 
 
-def scan_slack_channel_for_threads(channel_id, lookback_hours=24):
+def scan_slack_channel_for_threads(channel_id, lookback_hours=24, force_rescan=False):
     channel_id = clean_text(channel_id)
 
     try:
@@ -1106,12 +1213,17 @@ def scan_slack_channel_for_threads(channel_id, lookback_hours=24):
         lookback_hours = 24
 
     lookback_hours = max(1, lookback_hours)
+    force_rescan = bool(force_rescan)
 
     if not channel_id:
         raise ValueError("channel_id is required")
 
     messages = fetch_slack_channel_messages(channel_id, lookback_hours=lookback_hours)
     thread_parents = channel_thread_parent_messages(messages)
+    thread_parents = sorted(
+        thread_parents,
+        key=lambda message: float(message.get("thread_ts") or message.get("ts") or 0),
+    )
     analyzed_count = 0
     skipped_existing_count = 0
     failed_count = 0
@@ -1120,7 +1232,7 @@ def scan_slack_channel_for_threads(channel_id, lookback_hours=24):
         thread_ts = parent.get("thread_ts") or parent.get("ts")
         source_key = build_slack_source_key(channel_id, thread_ts)
 
-        if source_key_exists(source_key):
+        if source_key_exists(source_key) and not force_rescan:
             skipped_existing_count += 1
             continue
 
@@ -1141,6 +1253,7 @@ def scan_slack_channel_for_threads(channel_id, lookback_hours=24):
         "skipped_existing": skipped_existing_count,
         "failed": failed_count,
     }
+    save_channel_scan_history(channel_id, lookback_hours, force_rescan, result)
     logger.info("Channel scan result: %s", result)
     return result
 
@@ -1148,7 +1261,7 @@ def scan_slack_channel_for_threads(channel_id, lookback_hours=24):
 def format_channel_scan_result(result):
     return (
         f"Scanned {result.get('threads_found', 0)} thread(s): "
-        f"analyzed {result.get('analyzed', 0)} new, "
+        f"analyzed {result.get('analyzed', 0)} new or rescanned, "
         f"skipped {result.get('skipped_existing', 0)} existing, "
         f"failed {result.get('failed', 0)}."
     )
@@ -2131,7 +2244,10 @@ def apply_speaker_assignee_inference(analysis, messages):
 
 
 def clean_text(value):
-    return str(value or "").strip()
+    if value is None:
+        return ""
+
+    return str(value).strip()
 
 
 def clean_items(items, primary_field):
@@ -2660,6 +2776,57 @@ def render_dashboard_risks(risks):
 
 
 
+def render_dashboard_filter_tabs(active_filter="all"):
+    active_filter = normalize_dashboard_filter(active_filter)
+    filters = [
+        ("all", "All"),
+        ("risks", "Risks"),
+        ("new", "New"),
+        ("tracked", "Tracked"),
+        ("snoozed", "Snoozed"),
+        ("ignored", "Ignored"),
+    ]
+    links = []
+
+    for value, label in filters:
+        active_class = " active-filter" if value == active_filter else ""
+        links.append(
+            f'<a class="filter-link{active_class}" href="/dashboard?filter={html_escape(value)}">{html_escape(label)}</a>'
+        )
+
+    return '<nav class="filter-tabs">' + "".join(links) + '</nav>'
+
+
+def render_channel_scan_history(limit=5):
+    scans = get_recent_channel_scan_history(limit)
+
+    if not scans:
+        return ""
+
+    rows = []
+
+    for scan in scans:
+        force_label = " · force rescan" if scan.get("force_rescan") else ""
+        rows.append(
+            "<li>"
+            f"<strong>{html_escape(scan.get('channel_id', ''))}</strong>"
+            f" · {html_escape(scan.get('created_at', ''))}"
+            f" · {html_escape(scan.get('lookback_hours', ''))}h{force_label}"
+            f" · found {html_escape(scan.get('threads_found', 0))}"
+            f", analyzed {html_escape(scan.get('analyzed', 0))}"
+            f", skipped {html_escape(scan.get('skipped_existing', 0))}"
+            f", failed {html_escape(scan.get('failed', 0))}"
+            "</li>"
+        )
+
+    return f"""
+        <section class="scan-history-section">
+            <h2>Recent scans</h2>
+            <ol class="scan-history-list">{''.join(rows)}</ol>
+        </section>
+    """
+
+
 def render_scan_channel_form(scan_result=""):
     result_html = (
         f'<div class="scan-result">{html_escape(scan_result)}</div>'
@@ -2670,7 +2837,7 @@ def render_scan_channel_form(scan_result=""):
         <section class="scan-section">
             <div>
                 <h2>Scan channel</h2>
-                <p class="meta">Analyze recent Slack thread parents in a channel. Existing saved threads are skipped.</p>
+                <p class="meta">Analyze recent Slack thread parents in a channel. Existing saved threads are skipped unless force rescan is checked.</p>
             </div>
             <form class="scan-form" method="post" action="/dashboard/scan-channel">
                 <label>
@@ -2681,18 +2848,27 @@ def render_scan_channel_form(scan_result=""):
                     Lookback hours
                     <input name="lookback_hours" type="number" min="1" max="168" value="24" required>
                 </label>
+                <label class="checkbox-label">
+                    <input name="force_rescan" type="checkbox" value="1">
+                    Force rescan existing threads
+                </label>
                 <button type="submit">Scan channel</button>
             </form>
             {result_html}
         </section>
     """
 
-def render_dashboard_html(scan_result=""):
+def render_dashboard_html(scan_result="", item_filter="all"):
     cards = []
+    item_filter = normalize_dashboard_filter(item_filter)
     risks = get_dashboard_risks()
-    risk_html = render_dashboard_risks(risks)
+    risk_html = render_dashboard_risks(risks) if item_filter in {"all", "risks"} else ""
+    filter_tabs_html = render_dashboard_filter_tabs(item_filter)
+    scan_history_html = render_channel_scan_history()
 
-    for entry in get_recent_thread_analyses(MAX_ANALYSIS_HISTORY):
+    entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter)
+
+    for entry in entries:
         source_url = entry.get("source_url", "")
         source_link = (
             f'<a href="{html_escape(source_url)}" target="_blank" rel="noreferrer">Open Slack thread</a>'
@@ -2736,8 +2912,8 @@ def render_dashboard_html(scan_result=""):
     if not cards:
         cards.append("""
             <article class="card empty">
-                <h2>No thread analyses yet</h2>
-                <p>Run the Slack message shortcut, then refresh this page. Saved analyses will stay after a server restart.</p>
+                <h2>No matching dashboard items</h2>
+                <p>Run the Slack message shortcut or scan a channel, then refresh this page. Saved analyses will stay after a server restart.</p>
             </article>
         """)
 
@@ -2759,9 +2935,16 @@ def render_dashboard_html(scan_result=""):
             .scan-form {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-top: 14px; }}
             .scan-form label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
             .scan-form input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; min-width: 170px; font-size: 14px; }}
+            .scan-form input[type=checkbox] {{ min-width: 0; }}
+            .checkbox-label {{ flex-direction: row !important; align-items: center; padding-bottom: 8px; }}
             .scan-form button {{ border: 1px solid #2563eb; background: #2563eb; color: white; border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; }}
             .scan-form button:hover {{ background: #1d4ed8; }}
             .scan-result {{ margin-top: 12px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; border-radius: 12px; padding: 10px 12px; font-size: 14px; }}
+            .filter-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
+            .filter-link {{ border: 1px solid #d1d5db; background: white; color: #374151; border-radius: 999px; padding: 7px 11px; font-size: 14px; }}
+            .active-filter {{ border-color: #2563eb; background: #eff6ff; color: #1d4ed8; font-weight: 600; }}
+            .scan-history-section {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 18px 22px; margin-bottom: 24px; }}
+            .scan-history-list {{ margin: 10px 0 0; padding-left: 20px; color: #4b5563; font-size: 14px; }}
             .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
             .card-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }}
             .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
@@ -2802,6 +2985,8 @@ def render_dashboard_html(scan_result=""):
         </header>
         <main>
             {render_scan_channel_form(scan_result)}
+            {scan_history_html}
+            {filter_tabs_html}
             {risk_html}
             {''.join(cards)}
         </main>
@@ -3058,7 +3243,11 @@ def home():
 @app.get("/dashboard")
 def dashboard(request: Request):
     scan_result = request.query_params.get("scan_result", "")
-    return Response(content=render_dashboard_html(scan_result), media_type="text/html")
+    item_filter = request.query_params.get("filter", "all")
+    return Response(
+        content=render_dashboard_html(scan_result, item_filter),
+        media_type="text/html",
+    )
 
 
 @app.post("/dashboard/scan-channel")
@@ -3066,9 +3255,14 @@ async def scan_channel_from_dashboard(request: Request):
     form = await request.form()
     channel_id = clean_text(form.get("channel_id", ""))
     lookback_hours = clean_text(form.get("lookback_hours", "24")) or "24"
+    force_rescan = clean_text(form.get("force_rescan", "")) == "1"
 
     try:
-        result = scan_slack_channel_for_threads(channel_id, int(lookback_hours))
+        result = scan_slack_channel_for_threads(
+            channel_id,
+            lookback_hours,
+            force_rescan=force_rescan,
+        )
         message = format_channel_scan_result(result)
     except Exception as error:
         logger.exception("Dashboard channel scan failed")
