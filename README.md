@@ -1,77 +1,79 @@
 # Slack Linear Bot
 
-A Slack app that turns Slack messages and threads into Linear issues.
+A Slack app that analyzes Slack threads and turns explicit action items into Linear issues.
 
-It supports simple slash-command issue creation, AI-parsed natural language tasks, and Slack thread analysis with a safe preview → confirm → create flow.
+The current product flow is focused on Slack thread analysis, not single-message slash commands.
 
 ## What it does
 
-- Creates Linear issues from Slack using `/linear-task`
-- Supports title-only tasks
-- Supports title + description using `|`
-- Uses AI to extract title, description, priority, assignee, and due date from natural language
-- Maps Slack users to Linear users by email for “I,” “me,” and “myself” assignments
-- Supports preview mode so you can check an AI-parsed task before creating an issue
-- Analyzes pasted conversations for action items, unresolved questions, and proposed Linear issues
-- Analyzes real Slack threads through a message shortcut
-- Lets users confirm before creating Linear issues from a Slack thread
+- Analyzes real Slack threads through a Slack message shortcut
+- Extracts summaries, action items, unresolved questions, blockers, and decisions
+- Creates proposed Linear issues only from explicit action items
+- Keeps unresolved questions separate from Linear issues
+- Infers assignees from speaker ownership, such as “I can fix it” or “I’ll test it”
+- Infers due dates from relative dates, such as “by Wednesday”
+- Shows a preview before creating Linear issues
+- Lets the user choose **Create new Linear issue(s)** or **Cancel**
 - Adds Slack source links, evidence, and source keys to created Linear issue descriptions
-- Prevents duplicate Linear issue creation from the same Slack thread
+- Prevents duplicate Linear issues from the same Slack thread
+- Avoids matching test/QA tasks as duplicates of fix/implementation tasks
 
 ## Current product flow
-
-The main workflow is:
 
 ```text
 Slack thread
 → Analyze thread for Linear issues
-→ AI extracts action items, owners, due dates, unresolved questions, and proposed issues
+→ AI extracts action items and unresolved questions
+→ Code creates proposed Linear issues from action items only
 → User reviews preview
 → User clicks Create
 → Linear issues are created with Slack source context
+→ Re-analyzing the same thread shows already-tracked work
 ```
 
-This is the core differentiated feature. The basic `/linear-task ai:` command is useful, but the thread analysis flow is the more important product direction.
+This is the main MVP loop.
 
-## Example slash commands
+## Key product rule
+
+The AI does not directly generate proposed Linear issues.
+
+Instead:
 
 ```text
-/linear-task Fix login bug
+AI extracts action_items
+→ app converts action_items into proposed Linear issues
 ```
 
-```text
-/linear-task Fix login bug | Login redirects after OAuth.
-```
+This keeps the output safer and prevents unanswered questions from becoming tickets.
+
+Example:
 
 ```text
-/linear-task ai: I need to fix the login redirect bug by Friday and make it urgent
+Evan: The checkout page loses the selected shipping method after refresh. I can fix it by Wednesday.
+Sarah: I’ll test shipping method persistence after Evan’s fix.
+Alex: Should we also test guest checkout separately?
 ```
 
-```text
-/linear-task ai: Sarah should fix the dashboard loading bug by Friday
-```
+Expected behavior:
 
 ```text
-/linear-task preview ai: I need to fix the login redirect bug by Friday and make it urgent
+Action items:
+1. Fix checkout page shipping method persistence
+2. Test shipping method persistence after Evan’s fix
+
+Unresolved questions:
+1. Should we also test guest checkout separately?
+
+Proposed Linear issues:
+1. Fix checkout page shipping method persistence
+2. Test shipping method persistence after Evan’s fix
 ```
 
-```text
-/linear-task analyze-text ai: Evan: The login redirect bug is blocking launch. I can fix it by Friday.
-Sarah: I’ll test OAuth edge cases after that.
-Alex: Do we need this fixed on mobile too?
-```
-
-```text
-/linear-task analyze-thread CHANNEL_ID THREAD_TS
-```
-
-```text
-/linear-task help
-```
+No Linear issue should be created for Alex’s question unless someone explicitly commits to doing that work.
 
 ## Slack message shortcut
 
-The preferred thread workflow uses a Slack message shortcut.
+The preferred workflow uses a Slack message shortcut.
 
 Create a message shortcut in the Slack app dashboard:
 
@@ -95,11 +97,48 @@ Usage:
 4. Review the preview.
 5. Click **Create new Linear issue(s)** or **Cancel**.
 
+## Linear issue output
+
 Created Linear issues include:
 
-- Slack source thread link
-- Evidence from the Slack conversation
-- A stable source key used for duplicate prevention
+```text
+Source Slack thread:
+<Slack thread permalink>
+
+Slack source key:
+slack-thread:<channel_id>:<thread_ts>
+
+Evidence:
+<supporting Slack message>
+```
+
+The source key is used for duplicate prevention.
+
+## Duplicate prevention
+
+The bot checks existing Linear issues before creating new ones.
+
+Current duplicate rules:
+
+- Issues from the same Slack thread use a stable source key.
+- Same-thread duplicates require strict title/task similarity.
+- Test/QA tasks should not match fix/implementation tasks.
+- Broad semantic matching is avoided for issues from the same Slack thread.
+- Re-analyzing a thread after creation should show the issues as already tracked and hide the create button.
+
+Example:
+
+```text
+Fix checkout page shipping method persistence
+```
+
+should not match:
+
+```text
+Test shipping method persistence after Evan’s fix
+```
+
+Those are related, but they are different tasks.
 
 ## Environment variables
 
@@ -121,9 +160,7 @@ Do not commit `.env`.
 
 Your Slack app needs:
 
-- Slash command: `/linear-task`
-- Slash command request URL: your ngrok or deployed URL ending in `/slack/command`
-- Interactivity request URL: your ngrok or deployed URL ending in `/slack/interactive`
+- Interactivity request URL ending in `/slack/interactive`
 - Message shortcut callback ID: `analyze_thread_for_linear`
 
 Bot token scopes:
@@ -136,7 +173,7 @@ channels:history
 groups:history
 ```
 
-Optional if you want to support DMs and group DMs later:
+Optional for future DM support:
 
 ```text
 im:history
@@ -159,7 +196,11 @@ You need:
 - A Linear team ID
 - A Linear API key with read/write access
 
-The bot creates issues in the team specified by `LINEAR_TEAM_ID`.
+The bot creates issues in the team specified by:
+
+```text
+LINEAR_TEAM_ID
+```
 
 ## Run locally
 
@@ -178,9 +219,70 @@ ngrok http 8000
 Use the ngrok HTTPS URL in Slack settings:
 
 ```text
-https://your-ngrok-url.ngrok-free.dev/slack/command
 https://your-ngrok-url.ngrok-free.dev/slack/interactive
 ```
+
+## Quick test plan
+
+Create a fresh Slack thread.
+
+Parent message:
+
+```text
+Evan: The checkout page loses the selected shipping method after refresh. I can fix it by Wednesday.
+```
+
+Thread reply:
+
+```text
+Sarah: I’ll test shipping method persistence after Evan’s fix.
+```
+
+Thread reply:
+
+```text
+Alex: Should we also test guest checkout separately?
+```
+
+Run **Analyze thread for Linear issues** from the parent message.
+
+Expected preview:
+
+```text
+Action items
+1. fix the checkout page issue with shipping method persistence
+2. test shipping method persistence after Evan’s fix
+
+Unresolved questions
+1. Should we also test guest checkout separately?
+
+Proposed Linear issues
+1. fix the checkout page issue with shipping method persistence
+2. test shipping method persistence after Evan’s fix
+```
+
+Click **Create new Linear issue(s)**.
+
+Expected result:
+
+```text
+Created 2 Linear issue(s)
+```
+
+Run **Analyze thread for Linear issues** again on the same parent message.
+
+Expected result:
+
+```text
+Both proposed issues are matched to existing Linear issues.
+No create button is shown.
+```
+
+## Slash command behavior
+
+The old single-message `/linear-task ai:` and pasted-text test modes have been removed.
+
+The `/linear-task` endpoint still exists, but it only tells users to use the Slack message shortcut.
 
 ## Git safety
 
@@ -191,79 +293,30 @@ Your `.gitignore` should include:
 .venv
 __pycache__
 .DS_Store
+.claude/
 ```
-
-## Quick test plan
-
-```text
-/linear-task help
-```
-
-Should show help text and create no Linear issue.
-
-```text
-/linear-task Fix login bug
-```
-
-Should create a title-only Linear issue.
-
-```text
-/linear-task Fix login bug | Login redirects after OAuth.
-```
-
-Should create a Linear issue with a description.
-
-```text
-/linear-task preview ai: I need to fix the login redirect bug by Friday and make it urgent
-```
-
-Should show a preview and create no Linear issue.
-
-```text
-/linear-task ai: I need to fix the login redirect bug by Friday and make it urgent
-```
-
-Should create a Linear issue with priority, due date, and assignee if your Slack email matches your Linear email.
-
-```text
-/linear-task analyze-text ai: Evan: The login redirect bug is blocking launch. I can fix it by Friday.
-Sarah: I’ll test OAuth edge cases after that.
-Alex: Do we need this fixed on mobile too?
-```
-
-Should show a thread-style analysis preview and create no Linear issue.
-
-For the message shortcut:
-
-1. Create a Slack thread with test messages.
-2. Run **Analyze thread for Linear issues** from the message shortcut.
-3. Confirm the preview appears.
-4. Click **Create new Linear issue(s)**.
-5. Confirm Linear issues are created with source link and evidence.
-6. Analyze the same thread again and click create.
-7. Confirm duplicate issues are skipped.
 
 ## Current limitations
 
 - Pending previews are stored in memory, so they disappear if the server restarts.
-- Duplicate prevention works best for issues created after source-key support was added.
+- The session-created issue cache is also in memory.
+- Persistent duplicate prevention depends on the Slack source key saved in Linear issue descriptions.
 - The app is still local-first and uses ngrok for Slack testing.
 - No database yet.
+- No channel-wide scanning yet.
 - No GitHub execution tracking yet.
 
 ## Product direction
 
-The long-term goal is not just “create Linear issues from Slack.” Existing tools already do basic Slack-to-Linear workflows.
-
-The differentiated direction is:
+The near-term product is not just “create Linear issues from Slack.” The stronger direction is:
 
 ```text
 team conversation
-→ detected action items, decisions, blockers, and unresolved questions
+→ detected action items and unresolved questions
 → proposed tracked work
 → Linear issue creation or matching
 → later GitHub execution tracking
 → alerts when work falls through the cracks
 ```
 
-The next major feature should be existing-work detection and execution tracking across Linear and GitHub.
+Before expanding to GitHub or channel-wide scanning, keep the Slack-thread-to-Linear flow stable.

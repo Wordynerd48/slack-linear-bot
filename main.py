@@ -107,6 +107,168 @@ def database_source_key(source_key):
     return source_key or f"manual-analysis:{uuid.uuid4()}"
 
 
+def item_title_for_type(item_type, item):
+    if item_type == "action_item":
+        return clean_text(item.get("task", ""))
+
+    if item_type == "unresolved_question":
+        return clean_text(item.get("question", ""))
+
+    if item_type == "blocker":
+        return clean_text(item.get("blocker", ""))
+
+    return clean_text(item.get("title", ""))
+
+
+def item_signature(item_type, title):
+    return (clean_text(item_type), normalize_name(title))
+
+
+def previous_item_state_map(connection, analysis_id):
+    rows = connection.execute(
+        """
+        SELECT item_type, title, status, linear_identifier, linear_url,
+               existing_issue_match, existing_issue_match_type
+        FROM detected_items
+        WHERE analysis_id = ?
+        """,
+        (analysis_id,),
+    ).fetchall()
+
+    state = {}
+
+    for row in rows:
+        state[item_signature(row["item_type"], row["title"])] = {
+            "item_type": row["item_type"] or "",
+            "title": row["title"] or "",
+            "status": row["status"] or "new",
+            "linear_identifier": row["linear_identifier"] or "",
+            "linear_url": row["linear_url"] or "",
+            "existing_issue_match": row["existing_issue_match"] or "",
+            "existing_issue_match_type": row["existing_issue_match_type"] or "",
+        }
+
+    return state
+
+
+def previous_item_state_for(previous_state, item_type, title):
+    """Find prior status for a re-analyzed item.
+
+    The model may slightly rewrite the same action item/question across runs.
+    Preserve user decisions when the title is exact or strongly similar, while
+    avoiding the old bug where test tasks matched implementation tasks.
+    """
+    exact_state = previous_state.get(item_signature(item_type, title))
+
+    if exact_state:
+        return exact_state
+
+    best_state = None
+    best_score = 0
+    normalized_item_type = clean_text(item_type)
+
+    for (old_item_type, _old_normalized_title), old_state in previous_state.items():
+        if old_item_type != normalized_item_type:
+            continue
+
+        old_title = old_state.get("title", "")
+
+        if item_type == "proposed_issue":
+            old_issue = {"title": old_title}
+            new_issue = {"title": title}
+
+            if incompatible_task_types(new_issue, old_issue):
+                continue
+
+        score = max(
+            similarity(title, old_title),
+            token_overlap_score(title, old_title),
+        )
+
+        normalized_title = normalize_name(title)
+        normalized_old_title = normalize_name(old_title)
+
+        if normalized_title and normalized_old_title:
+            if normalized_title in normalized_old_title or normalized_old_title in normalized_title:
+                score = max(score, 0.9)
+
+        if score > best_score:
+            best_score = score
+            best_state = old_state
+
+    if best_state and best_score >= 0.82:
+        logger.info(
+            "Preserved prior status for re-analyzed item: type=%s title='%s' old_title='%s' score=%.2f",
+            item_type,
+            title,
+            best_state.get("title", ""),
+            best_score,
+        )
+        return best_state
+
+    return None
+
+
+
+
+def previous_related_item_state_for(previous_state, item_type, title):
+    """Preserve status across related action/proposed issue rows.
+
+    Action items and proposed issues represent the same underlying work, but
+    they are stored as separate dashboard rows. If a user ignores one, the
+    matching paired row should also stay ignored on re-analysis so Slack does
+    not offer to create a Linear issue for dismissed work.
+    """
+    if item_type == "proposed_issue":
+        candidate_types = ["action_item"]
+    elif item_type == "action_item":
+        candidate_types = ["proposed_issue"]
+    else:
+        candidate_types = []
+
+    best_state = None
+    best_score = 0
+    new_issue = {"title": title}
+
+    for (old_item_type, _old_normalized_title), old_state in previous_state.items():
+        if old_item_type not in candidate_types:
+            continue
+
+        old_title = old_state.get("title", "")
+        old_issue = {"title": old_title}
+
+        if incompatible_task_types(new_issue, old_issue):
+            continue
+
+        score = max(
+            similarity(title, old_title),
+            token_overlap_score(title, old_title),
+        )
+
+        normalized_title = normalize_name(title)
+        normalized_old_title = normalize_name(old_title)
+
+        if normalized_title and normalized_old_title:
+            if normalized_title in normalized_old_title or normalized_old_title in normalized_title:
+                score = max(score, 0.9)
+
+        if score > best_score:
+            best_score = score
+            best_state = old_state
+
+    if best_state and best_score >= 0.82:
+        logger.info(
+            "Preserved prior related status for re-analyzed item: type=%s title='%s' old_type=%s old_title='%s' score=%.2f",
+            item_type,
+            title,
+            best_state.get("item_type", ""),
+            best_state.get("title", ""),
+            best_score,
+        )
+        return best_state
+
+    return None
+
 def save_thread_analysis(source_key, source_url, analysis):
     source_key = database_source_key(source_key)
     now = current_timestamp()
@@ -118,8 +280,11 @@ def save_thread_analysis(source_key, source_url, analysis):
             (source_key,),
         ).fetchone()
 
+        previous_state = {}
+
         if existing:
             analysis_id = existing["id"]
+            previous_state = previous_item_state_map(connection, analysis_id)
             connection.execute(
                 """
                 UPDATE thread_analyses
@@ -143,16 +308,16 @@ def save_thread_analysis(source_key, source_url, analysis):
             analysis_id = cursor.lastrowid
 
         for item in analysis.get("action_items", []) or []:
-            insert_detected_item(connection, analysis_id, "action_item", item, now)
+            insert_detected_item(connection, analysis_id, "action_item", item, now, previous_state)
 
         for item in analysis.get("unresolved_questions", []) or []:
-            insert_detected_item(connection, analysis_id, "unresolved_question", item, now)
+            insert_detected_item(connection, analysis_id, "unresolved_question", item, now, previous_state)
 
         for item in analysis.get("blockers", []) or []:
-            insert_detected_item(connection, analysis_id, "blocker", item, now)
+            insert_detected_item(connection, analysis_id, "blocker", item, now, previous_state)
 
         for item in analysis.get("proposed_issues", []) or []:
-            item_id = insert_detected_item(connection, analysis_id, "proposed_issue", item, now)
+            item_id = insert_detected_item(connection, analysis_id, "proposed_issue", item, now, previous_state)
             item["detected_item_id"] = item_id
 
         connection.commit()
@@ -161,18 +326,15 @@ def save_thread_analysis(source_key, source_url, analysis):
     return analysis_id
 
 
-def insert_detected_item(connection, analysis_id, item_type, item, now):
+def insert_detected_item(connection, analysis_id, item_type, item, now, previous_state=None):
+    previous_state = previous_state or {}
+    title = item_title_for_type(item_type, item)
+
     if item_type == "action_item":
-        title = clean_text(item.get("task", ""))
         description = title
-    elif item_type == "unresolved_question":
-        title = clean_text(item.get("question", ""))
-        description = ""
-    elif item_type == "blocker":
-        title = clean_text(item.get("blocker", ""))
+    elif item_type in {"unresolved_question", "blocker"}:
         description = ""
     else:
-        title = clean_text(item.get("title", ""))
         description = clean_text(item.get("description", ""))
 
     if not title:
@@ -192,6 +354,37 @@ def insert_detected_item(connection, analysis_id, item_type, item, now):
             status = "new"
     else:
         status = "new"
+
+    old_state = previous_item_state_for(previous_state, item_type, title)
+
+    if not old_state:
+        old_state = previous_related_item_state_for(previous_state, item_type, title)
+
+    if old_state:
+        old_status = old_state.get("status", "")
+
+        if old_status in {"ignored", "created", "matched"}:
+            status = old_status
+
+        linear_identifier = linear_identifier or old_state.get("linear_identifier", "")
+        linear_url = linear_url or old_state.get("linear_url", "")
+        existing_match = existing_match or old_state.get("existing_issue_match", "")
+        existing_match_type = existing_match_type or old_state.get("existing_issue_match_type", "")
+
+    if item_type == "proposed_issue":
+        item["status"] = status
+
+        if linear_identifier:
+            item["linear_identifier"] = linear_identifier
+
+        if linear_url:
+            item["existing_issue_url"] = linear_url
+
+        if existing_match:
+            item["existing_issue_match"] = existing_match
+
+        if existing_match_type:
+            item["existing_issue_match_type"] = existing_match_type
 
     cursor = connection.execute(
         """
@@ -252,6 +445,114 @@ def mark_detected_item_created(detected_item_id, issue):
         connection.commit()
 
 
+def update_detected_item_status(item_id, status):
+    allowed_statuses = {"new", "ignored", "created", "matched", "possible_duplicate"}
+
+    if status not in allowed_statuses:
+        raise ValueError(f"Unsupported detected item status: {status}")
+
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        connection.execute(
+            """
+            UPDATE detected_items
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, now, item_id),
+        )
+        connection.commit()
+
+
+
+
+def ignore_related_detected_items(item_id):
+    """Ignore the selected dashboard item and its paired action/proposed row.
+
+    This prevents a dismissed action item from still appearing as a createable
+    proposed Linear issue in Slack after the same thread is analyzed again.
+    """
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        selected = connection.execute(
+            "SELECT * FROM detected_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+
+        if not selected:
+            return
+
+        connection.execute(
+            """
+            UPDATE detected_items
+            SET status = 'ignored', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, item_id),
+        )
+
+        selected_type = selected["item_type"]
+        selected_title = selected["title"] or ""
+
+        if selected_type == "action_item":
+            related_types = ["proposed_issue"]
+        elif selected_type == "proposed_issue":
+            related_types = ["action_item"]
+        else:
+            related_types = []
+
+        if related_types:
+            candidates = connection.execute(
+                """
+                SELECT * FROM detected_items
+                WHERE analysis_id = ?
+                  AND item_type IN ({})
+                  AND status != 'ignored'
+                """.format(",".join("?" for _ in related_types)),
+                (selected["analysis_id"], *related_types),
+            ).fetchall()
+
+            selected_issue = {"title": selected_title}
+
+            for candidate in candidates:
+                candidate_title = candidate["title"] or ""
+                candidate_issue = {"title": candidate_title}
+
+                if incompatible_task_types(selected_issue, candidate_issue):
+                    continue
+
+                score = max(
+                    similarity(selected_title, candidate_title),
+                    token_overlap_score(selected_title, candidate_title),
+                )
+
+                normalized_selected = normalize_name(selected_title)
+                normalized_candidate = normalize_name(candidate_title)
+
+                if normalized_selected and normalized_candidate:
+                    if normalized_selected in normalized_candidate or normalized_candidate in normalized_selected:
+                        score = max(score, 0.9)
+
+                if score >= 0.82:
+                    connection.execute(
+                        """
+                        UPDATE detected_items
+                        SET status = 'ignored', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, candidate["id"]),
+                    )
+                    logger.info(
+                        "Ignored related dashboard item: selected='%s' related='%s' score=%.2f",
+                        selected_title,
+                        candidate_title,
+                        score,
+                    )
+
+        connection.commit()
+
 def get_recent_thread_analyses(limit=20):
     init_database()
 
@@ -292,6 +593,9 @@ def get_recent_thread_analyses(limit=20):
             }
 
             for item in item_rows:
+                if item["status"] == "ignored":
+                    continue
+
                 item_dict = detected_item_to_dashboard_dict(item)
                 item_type = item["item_type"]
 
@@ -318,13 +622,18 @@ def detected_item_to_dashboard_dict(item):
     item_type = item["item_type"]
 
     if item_type == "action_item":
-        result = {"task": item["title"]}
+        result = {"id": item["id"], "item_type": item_type, "task": item["title"]}
     elif item_type == "unresolved_question":
-        result = {"question": item["title"]}
+        result = {"id": item["id"], "item_type": item_type, "question": item["title"]}
     elif item_type == "blocker":
-        result = {"blocker": item["title"]}
+        result = {"id": item["id"], "item_type": item_type, "blocker": item["title"]}
     else:
-        result = {"title": item["title"], "description": item["description"]}
+        result = {
+            "id": item["id"],
+            "item_type": item_type,
+            "title": item["title"],
+            "description": item["description"],
+        }
 
     optional_fields = [
         "assignee_name",
@@ -1659,6 +1968,11 @@ def format_thread_analysis_response(analysis, source_url=""):
 
 
 def proposed_issue_has_existing_match(proposed_issue):
+    status = clean_text(proposed_issue.get("status", ""))
+
+    if status in {"ignored", "created", "matched", "possible_duplicate"}:
+        return True
+
     return bool(proposed_issue.get("existing_issue_match") or proposed_issue.get("existing_issue_url"))
 
 
@@ -1749,19 +2063,34 @@ def html_escape(value):
     return html.escape(clean_text(value), quote=True)
 
 
+def render_ignore_button(item):
+    item_id = item.get("id")
+    status = clean_text(item.get("status", "new"))
+
+    if not item_id or status == "ignored":
+        return ""
+
+    return f"""
+        <form class="inline-form" method="post" action="/dashboard/items/{html_escape(item_id)}/ignore">
+            <button type="submit" class="ignore-button">Ignore</button>
+        </form>
+    """
+
+
 def render_item_list(items, primary_field):
     if not items:
         return '<p class="muted">None</p>'
 
+    hidden_fields = {"id", "item_type"}
     parts = ['<ol>']
 
     for item in items:
         primary_value = html_escape(item.get(primary_field, ""))
-        parts.append(f'<li><strong>{primary_value}</strong>')
+        parts.append(f'<li><div class="item-title"><strong>{primary_value}</strong>{render_ignore_button(item)}</div>')
         detail_parts = []
 
         for key, value in item.items():
-            if key == primary_field or not value:
+            if key == primary_field or key in hidden_fields or not value:
                 continue
 
             label = html_escape(key.replace("_", " ").title())
@@ -1848,6 +2177,10 @@ def render_dashboard_html():
             .meta, .muted {{ color: #6b7280; }}
             .meta {{ margin: 6px 0 0; font-size: 14px; }}
             .badge {{ white-space: nowrap; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 6px 10px; font-size: 13px; font-weight: 600; }}
+            .item-title {{ display: flex; align-items: center; gap: 10px; justify-content: space-between; }}
+            .inline-form {{ display: inline; margin: 0; }}
+            .ignore-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 3px 8px; font-size: 12px; cursor: pointer; }}
+            .ignore-button:hover {{ background: #f3f4f6; color: #111827; }}
             ol {{ margin: 0; padding-left: 20px; }}
             li {{ margin-bottom: 12px; }}
             .details {{ margin-top: 5px; color: #374151; font-size: 14px; line-height: 1.45; }}
@@ -1878,9 +2211,7 @@ def post_thread_analysis_preview(
     source_url="",
     source_key="",
 ):
-    message = format_thread_analysis_response(analysis, source_url)
     proposed_issues = analysis.get("proposed_issues", []) or []
-    createable_issues = createable_proposed_issues(proposed_issues)
     preview_id = str(uuid.uuid4())
 
     if source_key and source_key in CREATED_THREAD_ISSUES_BY_SOURCE_KEY:
@@ -1900,10 +2231,11 @@ def post_thread_analysis_preview(
             if match:
                 mark_existing_issue_match(proposed_issue, match)
 
-        createable_issues = createable_proposed_issues(proposed_issues)
-        message = format_thread_analysis_response(analysis, source_url)
-
     record_thread_analysis_history(analysis, source_url, source_key)
+
+    proposed_issues = analysis.get("proposed_issues", []) or []
+    createable_issues = createable_proposed_issues(proposed_issues)
+    message = format_thread_analysis_response(analysis, source_url)
 
     if createable_issues:
         PENDING_THREAD_PREVIEWS[preview_id] = {
@@ -1933,7 +2265,6 @@ def post_thread_analysis_preview(
         )
 
     requests.post(response_url, json=payload, timeout=10)
-
 
 
 def create_linear_issues_from_preview(preview):
@@ -2121,6 +2452,12 @@ def home():
 @app.get("/dashboard")
 def dashboard():
     return Response(content=render_dashboard_html(), media_type="text/html")
+
+
+@app.post("/dashboard/items/{item_id}/ignore")
+def ignore_dashboard_item(item_id: int):
+    ignore_related_detected_items(item_id)
+    return Response(status_code=303, headers={"Location": "/dashboard"})
 
 
 @app.post("/slack/interactive")
