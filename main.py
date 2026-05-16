@@ -1,12 +1,14 @@
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 
 import requests
@@ -31,14 +33,317 @@ LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
 LINEAR_API_URL = "https://api.linear.app/graphql"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "slack_linear.db")
 PENDING_THREAD_PREVIEWS = {}
 CREATED_THREAD_ISSUES_BY_SOURCE_KEY = {}
+MAX_ANALYSIS_HISTORY = 20
 
 
 @app.on_event("startup")
 def startup_check():
     require_env_vars()
+    init_database()
     logger.info("Slack Linear bot started")
+
+
+def get_database_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def current_timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def init_database():
+    with get_database_connection() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT UNIQUE NOT NULL,
+                source_url TEXT,
+                summary TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detected_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                analysis_id INTEGER NOT NULL,
+                item_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                assignee_name TEXT,
+                due_date TEXT,
+                priority TEXT,
+                evidence TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                linear_identifier TEXT,
+                linear_url TEXT,
+                existing_issue_match TEXT,
+                existing_issue_match_type TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (analysis_id) REFERENCES thread_analyses(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thread_analyses_updated_at ON thread_analyses(updated_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detected_items_analysis_id ON detected_items(analysis_id)"
+        )
+        connection.commit()
+
+
+def database_source_key(source_key):
+    source_key = clean_text(source_key)
+    return source_key or f"manual-analysis:{uuid.uuid4()}"
+
+
+def save_thread_analysis(source_key, source_url, analysis):
+    source_key = database_source_key(source_key)
+    now = current_timestamp()
+    summary = clean_text(analysis.get("summary", ""))
+
+    with get_database_connection() as connection:
+        existing = connection.execute(
+            "SELECT id, created_at FROM thread_analyses WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+
+        if existing:
+            analysis_id = existing["id"]
+            connection.execute(
+                """
+                UPDATE thread_analyses
+                SET source_url = ?, summary = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (source_url, summary, now, analysis_id),
+            )
+            connection.execute(
+                "DELETE FROM detected_items WHERE analysis_id = ?",
+                (analysis_id,),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                INSERT INTO thread_analyses (source_key, source_url, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (source_key, source_url, summary, now, now),
+            )
+            analysis_id = cursor.lastrowid
+
+        for item in analysis.get("action_items", []) or []:
+            insert_detected_item(connection, analysis_id, "action_item", item, now)
+
+        for item in analysis.get("unresolved_questions", []) or []:
+            insert_detected_item(connection, analysis_id, "unresolved_question", item, now)
+
+        for item in analysis.get("blockers", []) or []:
+            insert_detected_item(connection, analysis_id, "blocker", item, now)
+
+        for item in analysis.get("proposed_issues", []) or []:
+            item_id = insert_detected_item(connection, analysis_id, "proposed_issue", item, now)
+            item["detected_item_id"] = item_id
+
+        connection.commit()
+
+    logger.info("Saved thread analysis to SQLite: source_key=%s", source_key)
+    return analysis_id
+
+
+def insert_detected_item(connection, analysis_id, item_type, item, now):
+    if item_type == "action_item":
+        title = clean_text(item.get("task", ""))
+        description = title
+    elif item_type == "unresolved_question":
+        title = clean_text(item.get("question", ""))
+        description = ""
+    elif item_type == "blocker":
+        title = clean_text(item.get("blocker", ""))
+        description = ""
+    else:
+        title = clean_text(item.get("title", ""))
+        description = clean_text(item.get("description", ""))
+
+    if not title:
+        return None
+
+    existing_match = clean_text(item.get("existing_issue_match", ""))
+    existing_match_type = clean_text(item.get("existing_issue_match_type", ""))
+    linear_url = clean_text(item.get("existing_issue_url", ""))
+    linear_identifier = linear_identifier_from_match(existing_match)
+
+    if item_type == "proposed_issue":
+        if existing_match_type == "already_tracked":
+            status = "matched"
+        elif existing_match:
+            status = "possible_duplicate"
+        else:
+            status = "new"
+    else:
+        status = "new"
+
+    cursor = connection.execute(
+        """
+        INSERT INTO detected_items (
+            analysis_id, item_type, title, description, assignee_name, due_date,
+            priority, evidence, status, linear_identifier, linear_url,
+            existing_issue_match, existing_issue_match_type, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            analysis_id,
+            item_type,
+            title,
+            description,
+            clean_text(item.get("assignee_name", "") or item.get("owner", "")),
+            clean_text(item.get("due_date", "")),
+            clean_text(item.get("priority", "")),
+            clean_text(item.get("evidence", "")),
+            status,
+            linear_identifier,
+            linear_url,
+            existing_match,
+            existing_match_type,
+            now,
+            now,
+        ),
+    )
+    return cursor.lastrowid
+
+
+def linear_identifier_from_match(existing_match):
+    existing_match = clean_text(existing_match)
+    match = re.match(r"([A-Z]+-\d+):", existing_match)
+    return match.group(1) if match else ""
+
+
+def mark_detected_item_created(detected_item_id, issue):
+    if not detected_item_id:
+        return
+
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        connection.execute(
+            """
+            UPDATE detected_items
+            SET status = 'created', linear_identifier = ?, linear_url = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                issue.get("identifier", ""),
+                issue.get("url", ""),
+                now,
+                detected_item_id,
+            ),
+        )
+        connection.commit()
+
+
+def get_recent_thread_analyses(limit=20):
+    init_database()
+
+    with get_database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, source_key, source_url, summary, created_at, updated_at
+            FROM thread_analyses
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        entries = []
+
+        for row in rows:
+            item_rows = connection.execute(
+                """
+                SELECT * FROM detected_items
+                WHERE analysis_id = ?
+                ORDER BY id ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+
+            entry = {
+                "id": row["id"],
+                "source_key": row["source_key"],
+                "source_url": row["source_url"],
+                "summary": row["summary"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "action_items": [],
+                "unresolved_questions": [],
+                "blockers": [],
+                "proposed_issues": [],
+            }
+
+            for item in item_rows:
+                item_dict = detected_item_to_dashboard_dict(item)
+                item_type = item["item_type"]
+
+                if item_type == "action_item":
+                    entry["action_items"].append(item_dict)
+                elif item_type == "unresolved_question":
+                    entry["unresolved_questions"].append(item_dict)
+                elif item_type == "blocker":
+                    entry["blockers"].append(item_dict)
+                elif item_type == "proposed_issue":
+                    entry["proposed_issues"].append(item_dict)
+
+            proposed_issues = entry["proposed_issues"]
+            entry["createable_count"] = sum(
+                1 for item in proposed_issues if item.get("status") == "new"
+            )
+            entry["tracked_count"] = len(proposed_issues) - entry["createable_count"]
+            entries.append(entry)
+
+        return entries
+
+
+def detected_item_to_dashboard_dict(item):
+    item_type = item["item_type"]
+
+    if item_type == "action_item":
+        result = {"task": item["title"]}
+    elif item_type == "unresolved_question":
+        result = {"question": item["title"]}
+    elif item_type == "blocker":
+        result = {"blocker": item["title"]}
+    else:
+        result = {"title": item["title"], "description": item["description"]}
+
+    optional_fields = [
+        "assignee_name",
+        "due_date",
+        "priority",
+        "evidence",
+        "status",
+        "linear_identifier",
+        "linear_url",
+        "existing_issue_match",
+        "existing_issue_match_type",
+    ]
+
+    for field in optional_fields:
+        value = item[field]
+        if value:
+            result[field] = value
+
+    return result
 
 
 def require_env_vars():
@@ -1426,6 +1731,146 @@ def build_thread_analysis_blocks(preview_text, preview_id, proposed_issue_count)
 
 
 
+
+def compact_item_copy(item, fields):
+    return {
+        field: clean_text(item.get(field, ""))
+        for field in fields
+        if clean_text(item.get(field, ""))
+    }
+
+
+def record_thread_analysis_history(analysis, source_url="", source_key=""):
+    # Kept as a compatibility wrapper for the dashboard flow.
+    # The data now persists in SQLite instead of only living in memory.
+    return save_thread_analysis(source_key, source_url, analysis)
+
+def html_escape(value):
+    return html.escape(clean_text(value), quote=True)
+
+
+def render_item_list(items, primary_field):
+    if not items:
+        return '<p class="muted">None</p>'
+
+    parts = ['<ol>']
+
+    for item in items:
+        primary_value = html_escape(item.get(primary_field, ""))
+        parts.append(f'<li><strong>{primary_value}</strong>')
+        detail_parts = []
+
+        for key, value in item.items():
+            if key == primary_field or not value:
+                continue
+
+            label = html_escape(key.replace("_", " ").title())
+            detail_parts.append(f'<div><span class="label">{label}:</span> {html_escape(value)}</div>')
+
+        if detail_parts:
+            parts.append('<div class="details">' + "".join(detail_parts) + '</div>')
+
+        parts.append('</li>')
+
+    parts.append('</ol>')
+    return "".join(parts)
+
+
+def render_dashboard_html():
+    cards = []
+
+    for entry in get_recent_thread_analyses(MAX_ANALYSIS_HISTORY):
+        source_url = entry.get("source_url", "")
+        source_link = (
+            f'<a href="{html_escape(source_url)}" target="_blank" rel="noreferrer">Open Slack thread</a>'
+            if source_url else '<span class="muted">No source URL</span>'
+        )
+        createable_count = entry.get("createable_count", 0)
+        tracked_count = entry.get("tracked_count", 0)
+        status = (
+            f'{createable_count} new, {tracked_count} tracked'
+            if createable_count or tracked_count else 'no proposed issues'
+        )
+
+        cards.append(f"""
+            <article class="card">
+                <div class="card-header">
+                    <div>
+                        <h2>{html_escape(entry.get('summary', 'No summary available.'))}</h2>
+                        <p class="meta">{html_escape(entry.get('created_at', ''))} · {source_link}</p>
+                    </div>
+                    <span class="badge">{html_escape(status)}</span>
+                </div>
+
+                <div class="grid">
+                    <section>
+                        <h3>Action items</h3>
+                        {render_item_list(entry.get('action_items', []), 'task')}
+                    </section>
+                    <section>
+                        <h3>Proposed Linear issues</h3>
+                        {render_item_list(entry.get('proposed_issues', []), 'title')}
+                    </section>
+                </div>
+
+                <section>
+                    <h3>Unresolved questions</h3>
+                    {render_item_list(entry.get('unresolved_questions', []), 'question')}
+                </section>
+            </article>
+        """)
+
+    if not cards:
+        cards.append("""
+            <article class="card empty">
+                <h2>No thread analyses yet</h2>
+                <p>Run the Slack message shortcut, then refresh this page. Saved analyses will stay after a server restart.</p>
+            </article>
+        """)
+
+    return f"""
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Slack Linear Dashboard</title>
+        <style>
+            body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; color: #1f2937; }}
+            header {{ padding: 28px 36px; background: white; border-bottom: 1px solid #e5e7eb; }}
+            h1 {{ margin: 0 0 8px; font-size: 28px; }}
+            h2 {{ margin: 0; font-size: 18px; }}
+            h3 {{ margin: 18px 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #4b5563; }}
+            main {{ padding: 24px 36px 48px; max-width: 1100px; }}
+            .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
+            .card-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }}
+            .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
+            .meta, .muted {{ color: #6b7280; }}
+            .meta {{ margin: 6px 0 0; font-size: 14px; }}
+            .badge {{ white-space: nowrap; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 6px 10px; font-size: 13px; font-weight: 600; }}
+            ol {{ margin: 0; padding-left: 20px; }}
+            li {{ margin-bottom: 12px; }}
+            .details {{ margin-top: 5px; color: #374151; font-size: 14px; line-height: 1.45; }}
+            .label {{ color: #6b7280; }}
+            a {{ color: #2563eb; text-decoration: none; }}
+            a:hover {{ text-decoration: underline; }}
+            .empty {{ text-align: center; padding: 48px; }}
+            @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .grid {{ grid-template-columns: 1fr; }} .card-header {{ flex-direction: column; }} }}
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>Slack Linear Dashboard</h1>
+            <p class="meta">Saved Slack thread analyses from SQLite. Refresh after running the Slack shortcut.</p>
+        </header>
+        <main>
+            {''.join(cards)}
+        </main>
+    </body>
+    </html>
+    """
+
+
 def post_thread_analysis_preview(
     response_url,
     analysis,
@@ -1457,6 +1902,8 @@ def post_thread_analysis_preview(
 
         createable_issues = createable_proposed_issues(proposed_issues)
         message = format_thread_analysis_response(analysis, source_url)
+
+    record_thread_analysis_history(analysis, source_url, source_key)
 
     if createable_issues:
         PENDING_THREAD_PREVIEWS[preview_id] = {
@@ -1544,6 +1991,7 @@ def create_linear_issues_from_preview(preview):
         )
         issue = result["data"]["issueCreate"]["issue"]
         created_issues.append(issue)
+        mark_detected_item_created(proposed_issue.get("detected_item_id"), issue)
 
         existing_issue_record = {
             "id": issue.get("id", ""),
@@ -1668,6 +2116,11 @@ def process_analyze_thread_and_respond(channel_id, thread_ts, response_url, requ
 @app.get("/")
 def home():
     return {"message": "Slack Linear bot is running"}
+
+
+@app.get("/dashboard")
+def dashboard():
+    return Response(content=render_dashboard_html(), media_type="text/html")
 
 
 @app.post("/slack/interactive")
