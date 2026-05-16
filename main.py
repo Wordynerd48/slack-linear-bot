@@ -87,12 +87,21 @@ def init_database():
                 linear_url TEXT,
                 existing_issue_match TEXT,
                 existing_issue_match_type TEXT,
+                snoozed_until TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (analysis_id) REFERENCES thread_analyses(id) ON DELETE CASCADE
             )
             """
         )
+        existing_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(detected_items)").fetchall()
+        }
+
+        if "snoozed_until" not in existing_columns:
+            connection.execute("ALTER TABLE detected_items ADD COLUMN snoozed_until TEXT")
+
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_analyses_updated_at ON thread_analyses(updated_at DESC)"
         )
@@ -128,7 +137,7 @@ def previous_item_state_map(connection, analysis_id):
     rows = connection.execute(
         """
         SELECT item_type, title, status, linear_identifier, linear_url,
-               existing_issue_match, existing_issue_match_type
+               existing_issue_match, existing_issue_match_type, snoozed_until
         FROM detected_items
         WHERE analysis_id = ?
         """,
@@ -146,6 +155,7 @@ def previous_item_state_map(connection, analysis_id):
             "linear_url": row["linear_url"] or "",
             "existing_issue_match": row["existing_issue_match"] or "",
             "existing_issue_match_type": row["existing_issue_match_type"] or "",
+            "snoozed_until": row["snoozed_until"] or "",
         }
 
     return state
@@ -345,6 +355,7 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
     existing_match_type = clean_text(item.get("existing_issue_match_type", ""))
     linear_url = clean_text(item.get("existing_issue_url", ""))
     linear_identifier = linear_identifier_from_match(existing_match)
+    snoozed_until = clean_text(item.get("snoozed_until", ""))
 
     if item_type == "proposed_issue":
         if existing_match_type == "already_tracked":
@@ -371,6 +382,7 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
         linear_url = linear_url or old_state.get("linear_url", "")
         existing_match = existing_match or old_state.get("existing_issue_match", "")
         existing_match_type = existing_match_type or old_state.get("existing_issue_match_type", "")
+        snoozed_until = snoozed_until or old_state.get("snoozed_until", "")
 
     if item_type == "proposed_issue":
         item["status"] = status
@@ -387,14 +399,17 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
         if existing_match_type:
             item["existing_issue_match_type"] = existing_match_type
 
+        if snoozed_until:
+            item["snoozed_until"] = snoozed_until
+
     cursor = connection.execute(
         """
         INSERT INTO detected_items (
             analysis_id, item_type, title, description, assignee_name, due_date,
             priority, evidence, status, linear_identifier, linear_url,
-            existing_issue_match, existing_issue_match_type, created_at, updated_at
+            existing_issue_match, existing_issue_match_type, snoozed_until, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             analysis_id,
@@ -410,6 +425,7 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
             linear_url,
             existing_match,
             existing_match_type,
+            snoozed_until,
             now,
             now,
         ),
@@ -433,7 +449,7 @@ def mark_detected_item_created(detected_item_id, issue):
         connection.execute(
             """
             UPDATE detected_items
-            SET status = 'created', linear_identifier = ?, linear_url = ?, updated_at = ?
+            SET status = 'created', linear_identifier = ?, linear_url = ?, snoozed_until = '', updated_at = ?
             WHERE id = ?
             """,
             (
@@ -554,6 +570,158 @@ def ignore_related_detected_items(item_id):
 
         connection.commit()
 
+
+
+def related_detected_item_candidates(connection, selected, related_types):
+    if not related_types:
+        return []
+
+    return connection.execute(
+        """
+        SELECT * FROM detected_items
+        WHERE analysis_id = ?
+          AND item_type IN ({})
+        """.format(",".join("?" for _ in related_types)),
+        (selected["analysis_id"], *related_types),
+    ).fetchall()
+
+
+def matching_related_detected_items(connection, selected, related_types):
+    selected_title = selected["title"] or ""
+    selected_issue = {"title": selected_title}
+    matches = []
+
+    for candidate in related_detected_item_candidates(connection, selected, related_types):
+        if candidate["id"] == selected["id"]:
+            continue
+
+        candidate_title = candidate["title"] or ""
+        candidate_issue = {"title": candidate_title}
+
+        if incompatible_task_types(selected_issue, candidate_issue):
+            continue
+
+        score = max(
+            similarity(selected_title, candidate_title),
+            token_overlap_score(selected_title, candidate_title),
+        )
+
+        normalized_selected = normalize_name(selected_title)
+        normalized_candidate = normalize_name(candidate_title)
+
+        if normalized_selected and normalized_candidate:
+            if normalized_selected in normalized_candidate or normalized_candidate in normalized_selected:
+                score = max(score, 0.9)
+
+        if score >= 0.82:
+            matches.append(candidate)
+
+    return matches
+
+
+def mark_related_detected_items_tracked(item_id):
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        selected = connection.execute(
+            "SELECT * FROM detected_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+
+        if not selected:
+            return
+
+        connection.execute(
+            """
+            UPDATE detected_items
+            SET status = 'matched', snoozed_until = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, item_id),
+        )
+
+        selected_type = selected["item_type"]
+
+        if selected_type == "action_item":
+            related_types = ["proposed_issue"]
+        elif selected_type == "proposed_issue":
+            related_types = ["action_item"]
+        else:
+            related_types = []
+
+        for candidate in matching_related_detected_items(connection, selected, related_types):
+            connection.execute(
+                """
+                UPDATE detected_items
+                SET status = 'matched', snoozed_until = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, candidate["id"]),
+            )
+            logger.info(
+                "Marked related dashboard item tracked: selected='%s' related='%s'",
+                selected["title"] or "",
+                candidate["title"] or "",
+            )
+
+        connection.commit()
+
+
+def snooze_related_detected_items(item_id, hours):
+    hours = max(1, int(hours))
+    now = current_timestamp()
+    snoozed_until = (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_database_connection() as connection:
+        selected = connection.execute(
+            "SELECT * FROM detected_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+
+        if not selected:
+            return
+
+        connection.execute(
+            """
+            UPDATE detected_items
+            SET snoozed_until = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (snoozed_until, now, item_id),
+        )
+
+        selected_type = selected["item_type"]
+
+        if selected_type == "action_item":
+            related_types = ["proposed_issue"]
+        elif selected_type == "proposed_issue":
+            related_types = ["action_item"]
+        else:
+            related_types = []
+
+        for candidate in matching_related_detected_items(connection, selected, related_types):
+            connection.execute(
+                """
+                UPDATE detected_items
+                SET snoozed_until = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (snoozed_until, now, candidate["id"]),
+            )
+            logger.info(
+                "Snoozed related dashboard item: selected='%s' related='%s' until=%s",
+                selected["title"] or "",
+                candidate["title"] or "",
+                snoozed_until,
+            )
+
+        connection.commit()
+
+
+def is_future_timestamp(value):
+    timestamp = parse_database_timestamp(value)
+    return bool(timestamp and timestamp > datetime.now())
+
 def get_recent_thread_analyses(limit=20):
     init_database()
 
@@ -646,6 +814,7 @@ def detected_item_to_dashboard_dict(item):
         "linear_url",
         "existing_issue_match",
         "existing_issue_match_type",
+        "snoozed_until",
     ]
 
     for field in optional_fields:
@@ -722,10 +891,15 @@ def get_dashboard_risks(limit=50):
             JOIN thread_analyses ON thread_analyses.id = detected_items.analysis_id
             WHERE detected_items.status = 'new'
               AND detected_items.item_type IN ('proposed_issue', 'unresolved_question', 'blocker')
+              AND (
+                  detected_items.snoozed_until IS NULL
+                  OR detected_items.snoozed_until = ''
+                  OR detected_items.snoozed_until <= ?
+              )
             ORDER BY detected_items.created_at ASC
             LIMIT ?
             """,
-            (limit,),
+            (current_timestamp(), limit),
         ).fetchall()
 
     risks = []
@@ -2094,6 +2268,9 @@ def proposed_issue_has_existing_match(proposed_issue):
     if status in {"ignored", "created", "matched", "possible_duplicate"}:
         return True
 
+    if is_future_timestamp(proposed_issue.get("snoozed_until", "")):
+        return True
+
     return bool(proposed_issue.get("existing_issue_match") or proposed_issue.get("existing_issue_url"))
 
 
@@ -2198,6 +2375,52 @@ def render_ignore_button(item):
     """
 
 
+def render_mark_tracked_button(item):
+    item_id = item.get("id")
+    item_type = clean_text(item.get("item_type", ""))
+    status = clean_text(item.get("status", "new"))
+
+    if not item_id or status in {"ignored", "created", "matched"}:
+        return ""
+
+    if item_type not in {"action_item", "proposed_issue", "blocker"}:
+        return ""
+
+    return f"""
+        <form class="inline-form" method="post" action="/dashboard/items/{html_escape(item_id)}/mark-tracked">
+            <button type="submit" class="track-button">Mark tracked</button>
+        </form>
+    """
+
+
+def render_snooze_button(item, hours=24):
+    item_id = item.get("id")
+    status = clean_text(item.get("status", "new"))
+
+    if not item_id or status in {"ignored", "created", "matched"}:
+        return ""
+
+    return f"""
+        <form class="inline-form" method="post" action="/dashboard/items/{html_escape(item_id)}/snooze/{hours}">
+            <button type="submit" class="snooze-button">Snooze {hours}h</button>
+        </form>
+    """
+
+
+def render_item_actions(item):
+    actions = [
+        render_mark_tracked_button(item),
+        render_snooze_button(item, 24),
+        render_ignore_button(item),
+    ]
+    actions = [action for action in actions if action]
+
+    if not actions:
+        return ""
+
+    return '<div class="item-actions">' + "".join(actions) + "</div>"
+
+
 def render_item_list(items, primary_field):
     if not items:
         return '<p class="muted">None</p>'
@@ -2207,7 +2430,7 @@ def render_item_list(items, primary_field):
 
     for item in items:
         primary_value = html_escape(item.get(primary_field, ""))
-        parts.append(f'<li><div class="item-title"><strong>{primary_value}</strong>{render_ignore_button(item)}</div>')
+        parts.append(f'<li><div class="item-title"><strong>{primary_value}</strong>{render_item_actions(item)}</div>')
         detail_parts = []
 
         for key, value in item.items():
@@ -2265,7 +2488,7 @@ def render_dashboard_risks(risks):
                         {summary_line}
                         <ul class="risk-reasons">{reasons}</ul>
                     </div>
-                    {render_ignore_button(item)}
+                    {render_item_actions(item)}
                 </div>
             </article>
         """)
@@ -2372,8 +2595,11 @@ def render_dashboard_html():
             .risk-reasons {{ margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 14px; }}
             .item-title {{ display: flex; align-items: center; gap: 10px; justify-content: space-between; }}
             .inline-form {{ display: inline; margin: 0; }}
-            .ignore-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 3px 8px; font-size: 12px; cursor: pointer; }}
-            .ignore-button:hover {{ background: #f3f4f6; color: #111827; }}
+            .item-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }}
+            .ignore-button, .track-button, .snooze-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 3px 8px; font-size: 12px; cursor: pointer; }}
+            .ignore-button:hover, .track-button:hover, .snooze-button:hover {{ background: #f3f4f6; color: #111827; }}
+            .track-button {{ border-color: #bfdbfe; color: #1d4ed8; }}
+            .snooze-button {{ border-color: #fde68a; color: #92400e; }}
             ol {{ margin: 0; padding-left: 20px; }}
             li {{ margin-bottom: 12px; }}
             .details {{ margin-top: 5px; color: #374151; font-size: 14px; line-height: 1.45; }}
@@ -2651,6 +2877,18 @@ def dashboard():
 @app.post("/dashboard/items/{item_id}/ignore")
 def ignore_dashboard_item(item_id: int):
     ignore_related_detected_items(item_id)
+    return Response(status_code=303, headers={"Location": "/dashboard"})
+
+
+@app.post("/dashboard/items/{item_id}/mark-tracked")
+def mark_dashboard_item_tracked(item_id: int):
+    mark_related_detected_items_tracked(item_id)
+    return Response(status_code=303, headers={"Location": "/dashboard"})
+
+
+@app.post("/dashboard/items/{item_id}/snooze/{hours}")
+def snooze_dashboard_item(item_id: int, hours: int):
+    snooze_related_detected_items(item_id, hours)
     return Response(status_code=303, headers={"Location": "/dashboard"})
 
 
