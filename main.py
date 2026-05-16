@@ -9,6 +9,7 @@ import sqlite3
 import time
 import uuid
 from datetime import date, datetime, timedelta
+from urllib.parse import quote
 from difflib import SequenceMatcher
 
 import requests
@@ -1003,6 +1004,154 @@ def slack_api_get(endpoint, params=None):
 
     return data
 
+
+
+
+def fetch_slack_channel_messages(channel_id, lookback_hours=24, limit=100):
+    channel_id = clean_text(channel_id)
+
+    try:
+        lookback_hours = int(lookback_hours or 24)
+    except (TypeError, ValueError):
+        lookback_hours = 24
+
+    lookback_hours = max(1, lookback_hours)
+    oldest = str(time.time() - lookback_hours * 60 * 60)
+
+    if not channel_id:
+        raise ValueError("channel_id is required")
+
+    data = slack_api_get(
+        "conversations.history",
+        {
+            "channel": channel_id,
+            "oldest": oldest,
+            "limit": limit,
+        },
+    )
+
+    messages = data.get("messages", []) or []
+    logger.info(
+        "Fetched %s Slack channel messages from channel=%s lookback_hours=%s",
+        len(messages),
+        channel_id,
+        lookback_hours,
+    )
+    return messages
+
+
+def source_key_exists(source_key):
+    source_key = clean_text(source_key)
+
+    if not source_key:
+        return False
+
+    init_database()
+
+    with get_database_connection() as connection:
+        row = connection.execute(
+            "SELECT id FROM thread_analyses WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+
+    return row is not None
+
+
+def channel_thread_parent_messages(messages):
+    parents = []
+    seen_thread_ts = set()
+
+    for message in messages or []:
+        if message.get("subtype"):
+            continue
+
+        if int(message.get("reply_count") or 0) <= 0:
+            continue
+
+        thread_ts = message.get("thread_ts") or message.get("ts")
+
+        if not thread_ts or thread_ts in seen_thread_ts:
+            continue
+
+        seen_thread_ts.add(thread_ts)
+        parents.append(message)
+
+    return parents
+
+
+def analyze_and_save_thread_from_channel_scan(channel_id, thread_ts):
+    messages = fetch_slack_thread(channel_id, thread_ts)
+
+    if not messages:
+        return False
+
+    analysis = analyze_thread_with_ai(messages)
+    source_url = get_slack_thread_permalink(channel_id, thread_ts)
+    source_key = build_slack_source_key(channel_id, thread_ts)
+    analysis = annotate_existing_linear_matches(
+        analysis,
+        source_url=source_url,
+        source_key=source_key,
+    )
+    save_thread_analysis(source_key, source_url, analysis)
+    return True
+
+
+def scan_slack_channel_for_threads(channel_id, lookback_hours=24):
+    channel_id = clean_text(channel_id)
+
+    try:
+        lookback_hours = int(lookback_hours or 24)
+    except (TypeError, ValueError):
+        lookback_hours = 24
+
+    lookback_hours = max(1, lookback_hours)
+
+    if not channel_id:
+        raise ValueError("channel_id is required")
+
+    messages = fetch_slack_channel_messages(channel_id, lookback_hours=lookback_hours)
+    thread_parents = channel_thread_parent_messages(messages)
+    analyzed_count = 0
+    skipped_existing_count = 0
+    failed_count = 0
+
+    for parent in thread_parents:
+        thread_ts = parent.get("thread_ts") or parent.get("ts")
+        source_key = build_slack_source_key(channel_id, thread_ts)
+
+        if source_key_exists(source_key):
+            skipped_existing_count += 1
+            continue
+
+        try:
+            if analyze_and_save_thread_from_channel_scan(channel_id, thread_ts):
+                analyzed_count += 1
+        except Exception:
+            failed_count += 1
+            logger.exception(
+                "Could not analyze scanned Slack thread: channel_id=%s thread_ts=%s",
+                channel_id,
+                thread_ts,
+            )
+
+    result = {
+        "threads_found": len(thread_parents),
+        "analyzed": analyzed_count,
+        "skipped_existing": skipped_existing_count,
+        "failed": failed_count,
+    }
+    logger.info("Channel scan result: %s", result)
+    return result
+
+
+def format_channel_scan_result(result):
+    return (
+        f"Scanned {result.get('threads_found', 0)} thread(s): "
+        f"analyzed {result.get('analyzed', 0)} new, "
+        f"skipped {result.get('skipped_existing', 0)} existing, "
+        f"failed {result.get('failed', 0)}."
+    )
 
 def fetch_slack_thread(channel_id, thread_ts):
     if not channel_id:
@@ -2509,7 +2658,36 @@ def render_dashboard_risks(risks):
     """
 
 
-def render_dashboard_html():
+
+
+def render_scan_channel_form(scan_result=""):
+    result_html = (
+        f'<div class="scan-result">{html_escape(scan_result)}</div>'
+        if scan_result else ""
+    )
+
+    return f"""
+        <section class="scan-section">
+            <div>
+                <h2>Scan channel</h2>
+                <p class="meta">Analyze recent Slack thread parents in a channel. Existing saved threads are skipped.</p>
+            </div>
+            <form class="scan-form" method="post" action="/dashboard/scan-channel">
+                <label>
+                    Channel ID
+                    <input name="channel_id" type="text" placeholder="C1234567890" required>
+                </label>
+                <label>
+                    Lookback hours
+                    <input name="lookback_hours" type="number" min="1" max="168" value="24" required>
+                </label>
+                <button type="submit">Scan channel</button>
+            </form>
+            {result_html}
+        </section>
+    """
+
+def render_dashboard_html(scan_result=""):
     cards = []
     risks = get_dashboard_risks()
     risk_html = render_dashboard_risks(risks)
@@ -2577,6 +2755,13 @@ def render_dashboard_html():
             h2 {{ margin: 0; font-size: 18px; }}
             h3 {{ margin: 18px 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #4b5563; }}
             main {{ padding: 24px 36px 48px; max-width: 1100px; }}
+            .scan-section {{ background: white; border: 1px solid #dbeafe; border-radius: 18px; padding: 22px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
+            .scan-form {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-top: 14px; }}
+            .scan-form label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
+            .scan-form input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; min-width: 170px; font-size: 14px; }}
+            .scan-form button {{ border: 1px solid #2563eb; background: #2563eb; color: white; border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; }}
+            .scan-form button:hover {{ background: #1d4ed8; }}
+            .scan-result {{ margin-top: 12px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; border-radius: 12px; padding: 10px 12px; font-size: 14px; }}
             .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
             .card-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }}
             .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
@@ -2616,6 +2801,7 @@ def render_dashboard_html():
             <p class="meta">Saved Slack thread analyses from SQLite. Refresh after running the Slack shortcut.</p>
         </header>
         <main>
+            {render_scan_channel_form(scan_result)}
             {risk_html}
             {''.join(cards)}
         </main>
@@ -2870,8 +3056,28 @@ def home():
 
 
 @app.get("/dashboard")
-def dashboard():
-    return Response(content=render_dashboard_html(), media_type="text/html")
+def dashboard(request: Request):
+    scan_result = request.query_params.get("scan_result", "")
+    return Response(content=render_dashboard_html(scan_result), media_type="text/html")
+
+
+@app.post("/dashboard/scan-channel")
+async def scan_channel_from_dashboard(request: Request):
+    form = await request.form()
+    channel_id = clean_text(form.get("channel_id", ""))
+    lookback_hours = clean_text(form.get("lookback_hours", "24")) or "24"
+
+    try:
+        result = scan_slack_channel_for_threads(channel_id, int(lookback_hours))
+        message = format_channel_scan_result(result)
+    except Exception as error:
+        logger.exception("Dashboard channel scan failed")
+        message = f"Channel scan failed: {error}"
+
+    return Response(
+        status_code=303,
+        headers={"Location": f"/dashboard?scan_result={quote(message)}"},
+    )
 
 
 @app.post("/dashboard/items/{item_id}/ignore")

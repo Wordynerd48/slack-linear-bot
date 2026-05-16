@@ -661,3 +661,252 @@ def test_snooze_status_survives_reanalysis(temp_database):
 
     assert fix_rows
     assert all(row["snoozed_until"] for row in fix_rows)
+
+def test_channel_thread_parent_messages_keeps_only_real_thread_parents():
+    messages = [
+        {
+            "ts": "111.000",
+            "text": "Real parent thread",
+            "reply_count": 2,
+        },
+        {
+            "ts": "222.000",
+            "text": "No replies",
+            "reply_count": 0,
+        },
+        {
+            "ts": "333.000",
+            "text": "Bot message",
+            "reply_count": 2,
+            "subtype": "bot_message",
+        },
+        {
+            "ts": "444.000",
+            "text": "Join message",
+            "reply_count": 2,
+            "subtype": "channel_join",
+        },
+        {
+            "ts": "111.000",
+            "thread_ts": "111.000",
+            "text": "Duplicate same thread",
+            "reply_count": 3,
+        },
+    ]
+
+    thread_parents = main.channel_thread_parent_messages(messages)
+
+    assert len(thread_parents) == 1
+    assert thread_parents[0]["ts"] == "111.000"
+
+
+def test_channel_thread_parent_messages_uses_thread_ts_when_present():
+    messages = [
+        {
+            "ts": "111.001",
+            "thread_ts": "111.000",
+            "text": "Thread parent style message",
+            "reply_count": 2,
+        }
+    ]
+
+    thread_parents = main.channel_thread_parent_messages(messages)
+
+    assert len(thread_parents) == 1
+    assert thread_parents[0]["thread_ts"] == "111.000"
+
+
+def test_scan_channel_analyzes_new_thread_and_saves_result(temp_database, monkeypatch):
+    channel_id = "C123"
+    thread_ts = "111.000"
+    source_key = main.build_slack_source_key(channel_id, thread_ts)
+
+    def fake_fetch_slack_channel_messages(channel_id_arg, lookback_hours=24):
+        assert channel_id_arg == channel_id
+        assert lookback_hours == 24
+        return [
+            {
+                "ts": thread_ts,
+                "text": "Parent",
+                "reply_count": 2,
+            }
+        ]
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+        assert channel_id_arg == channel_id
+        assert thread_ts_arg == thread_ts
+        analysis = saved_analysis(source_key)
+        main.save_thread_analysis(
+            source_key,
+            "https://example.slack.com/thread",
+            analysis,
+        )
+        return analysis
+
+    monkeypatch.setattr(main, "fetch_slack_channel_messages", fake_fetch_slack_channel_messages)
+    monkeypatch.setattr(main, "analyze_and_save_thread_from_channel_scan", fake_analyze_and_save_thread_from_channel_scan)
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=24)
+
+    assert result == {
+        "threads_found": 1,
+        "analyzed": 1,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+
+    rows = get_items_for_source(source_key)
+    assert any(row["item_type"] == "proposed_issue" for row in rows)
+
+
+def test_scan_channel_skips_existing_thread(temp_database, monkeypatch):
+    channel_id = "C123"
+    thread_ts = "111.000"
+    source_key = main.build_slack_source_key(channel_id, thread_ts)
+
+    main.save_thread_analysis(
+        source_key,
+        "https://example.slack.com/thread",
+        saved_analysis(source_key),
+    )
+
+    analyze_calls = []
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": thread_ts,
+                "text": "Parent",
+                "reply_count": 2,
+            }
+        ],
+    )
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+        analyze_calls.append((channel_id_arg, thread_ts_arg))
+
+    monkeypatch.setattr(main, "analyze_and_save_thread_from_channel_scan", fake_analyze_and_save_thread_from_channel_scan)
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=24)
+
+    assert result == {
+        "threads_found": 1,
+        "analyzed": 0,
+        "skipped_existing": 1,
+        "failed": 0,
+    }
+    assert analyze_calls == []
+
+
+def test_scan_channel_counts_failed_thread_without_stopping(temp_database, monkeypatch):
+    channel_id = "C123"
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": "111.000",
+                "text": "First parent",
+                "reply_count": 2,
+            },
+            {
+                "ts": "222.000",
+                "text": "Second parent",
+                "reply_count": 2,
+            },
+        ],
+    )
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg):
+        if thread_ts_arg == "111.000":
+            raise RuntimeError("fake scan failure")
+
+        source_key = main.build_slack_source_key(channel_id_arg, thread_ts_arg)
+        main.save_thread_analysis(
+            source_key,
+            "https://example.slack.com/thread",
+            saved_analysis(source_key),
+        )
+        return True
+
+    monkeypatch.setattr(main, "analyze_and_save_thread_from_channel_scan", fake_analyze_and_save_thread_from_channel_scan)
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=24)
+
+    assert result == {
+        "threads_found": 2,
+        "analyzed": 1,
+        "skipped_existing": 0,
+        "failed": 1,
+    }
+
+    successful_source_key = main.build_slack_source_key(channel_id, "222.000")
+    rows = get_items_for_source(successful_source_key)
+    assert rows
+
+
+def test_scan_channel_clamps_invalid_lookback_hours(temp_database, monkeypatch):
+    channel_id = "C123"
+    captured_oldest_values = []
+
+    def fake_fetch_slack_channel_messages(channel_id_arg, lookback_hours=24):
+        captured_oldest_values.append(lookback_hours)
+        return []
+
+    monkeypatch.setattr(main, "fetch_slack_channel_messages", fake_fetch_slack_channel_messages)
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours="not-a-number")
+
+    assert result == {
+        "threads_found": 0,
+        "analyzed": 0,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+    assert len(captured_oldest_values) == 1
+    assert captured_oldest_values[0] == 24
+
+
+def test_fetch_slack_channel_messages_calls_slack_history(monkeypatch):
+    calls = []
+
+    def fake_slack_api_get(endpoint, params=None):
+        calls.append((endpoint, params))
+        return {
+            "messages": [
+                {
+                    "ts": "111.000",
+                    "text": "Parent",
+                    "reply_count": 2,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(main, "slack_api_get", fake_slack_api_get)
+
+    messages = main.fetch_slack_channel_messages("C123", lookback_hours=24)
+
+    assert messages == [
+        {
+            "ts": "111.000",
+            "text": "Parent",
+            "reply_count": 2,
+        }
+    ]
+    assert calls
+    assert calls[0][0] == "conversations.history"
+    assert calls[0][1]["channel"] == "C123"
+    assert calls[0][1]["limit"] == 100
+    assert "oldest" in calls[0][1]
+
+
+def test_dashboard_scan_form_is_rendered():
+    html = main.render_dashboard_html()
+
+    assert 'action="/dashboard/scan-channel"' in html
+    assert 'name="channel_id"' in html
+    assert 'name="lookback_hours"' in html
+    assert "Scan channel" in html
