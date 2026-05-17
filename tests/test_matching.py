@@ -1484,3 +1484,71 @@ def test_question_evidence_action_does_not_create_proposed_issue_when_saved(temp
 
     assert [row["item_type"] for row in rows] == ["unresolved_question"]
     assert rows[0]["title"] == "Should we also test backup code settings?"
+
+
+def test_dashboard_renders_collapsible_thread_cards(temp_database):
+    source_key = "slack-thread:C123:collapsible-card"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    html = main.render_dashboard_html()
+
+    assert '<details class="card thread-card"' in html
+    assert '<summary class="thread-summary">' in html
+    assert "Recent thread history" in html
+    assert "Cards are collapsed by default" in html
+
+
+def test_dashboard_renders_compact_item_rows_and_details(temp_database):
+    source_key = "slack-thread:C123:compact-rows"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    html = main.render_dashboard_html()
+
+    assert "compact-item-list" in html
+    assert "item-row" in html
+    assert "status-pill" in html
+    assert "Details" in html
+    assert "Evidence:" in html
+
+
+def test_dashboard_search_filters_thread_history(temp_database):
+    first_key = "slack-thread:C123:search-checkout"
+    second_key = "slack-thread:C123:search-billing"
+
+    checkout = saved_analysis(first_key)
+    billing = saved_analysis(second_key)
+    billing["summary"] = "Evan will fix billing preferences."
+    billing["action_items"][0]["task"] = "fix billing preferences persistence"
+    billing["proposed_issues"][0]["title"] = "fix billing preferences persistence"
+
+    main.save_thread_analysis(first_key, "https://example.slack.com/checkout", checkout)
+    main.save_thread_analysis(second_key, "https://example.slack.com/billing", billing)
+
+    html = main.render_dashboard_html(search_query="billing")
+
+    assert "billing preferences" in html
+    assert "checkout persistence" not in html
+
+
+def test_dashboard_search_form_preserves_active_filter():
+    html = main.render_dashboard_html(item_filter="tracked", search_query="FLO-123")
+
+    assert 'class="dashboard-search"' in html
+    assert 'name="q"' in html
+    assert 'value="FLO-123"' in html
+    assert 'name="filter" value="tracked"' in html
+    assert '/dashboard?filter=tracked&amp;q=FLO-123' in html
+
+
+def test_dashboard_separates_review_queue_from_history(temp_database):
+    source_key = "slack-thread:C123:review-history"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "urgent"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    html = main.render_dashboard_html()
+
+    assert "Needs review" in html
+    assert "Recent thread history" in html
+    assert "risk-section" in html
+    assert "history-section" in html

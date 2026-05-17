@@ -2964,41 +2964,126 @@ def render_item_actions(item):
     return '<div class="item-actions">' + "".join(actions) + "</div>"
 
 
+def item_display_title(item, primary_field):
+    return clean_text(item.get(primary_field, ""))
+
+
+def item_status_label(item):
+    status = clean_text(item.get("status", "new")) or "new"
+
+    if is_future_timestamp(item.get("snoozed_until", "")) and status not in {"ignored", "created", "matched"}:
+        return "snoozed"
+
+    if status == "possible_duplicate":
+        return "possible duplicate"
+
+    return status
+
+
+def item_meta_parts(item):
+    parts = []
+    assignee = clean_text(item.get("assignee_name", "") or item.get("owner", ""))
+    priority = clean_text(item.get("priority", ""))
+    due_date = clean_text(item.get("due_date", ""))
+    linear_identifier = clean_text(item.get("linear_identifier", ""))
+
+    if assignee:
+        parts.append(assignee)
+    if priority and priority != "none":
+        parts.append(priority)
+    if due_date:
+        parts.append(f"due {due_date}")
+    if linear_identifier:
+        parts.append(linear_identifier)
+
+    return parts
+
+
+def render_status_pill(item):
+    label = item_status_label(item)
+    css_label = normalize_name(label).replace(" ", "-") or "new"
+    return f'<span class="status-pill status-{html_escape(css_label)}">{html_escape(label)}</span>'
+
+
+def render_evidence_details(item):
+    evidence = clean_text(item.get("evidence", ""))
+    description = clean_text(item.get("description", ""))
+    existing_match = clean_text(item.get("existing_issue_match", ""))
+    linear_url = clean_text(item.get("linear_url", ""))
+    snoozed_until = clean_text(item.get("snoozed_until", ""))
+    rows = []
+
+    if description and description != clean_text(item.get("title", "")):
+        rows.append(f'<div><span class="label">Description:</span> {html_escape(description)}</div>')
+    if existing_match:
+        rows.append(f'<div><span class="label">Linear:</span> {html_escape(existing_match)}</div>')
+    elif linear_url:
+        rows.append(f'<div><span class="label">Linear:</span> <a href="{html_escape(linear_url)}" target="_blank" rel="noreferrer">{html_escape(linear_url)}</a></div>')
+    if snoozed_until:
+        rows.append(f'<div><span class="label">Snoozed until:</span> {html_escape(snoozed_until)}</div>')
+    if evidence:
+        rows.append(f'<div><span class="label">Evidence:</span> {html_escape(evidence)}</div>')
+
+    if not rows:
+        return ""
+
+    return f'''
+        <details class="item-details">
+            <summary>Details</summary>
+            <div class="details">{''.join(rows)}</div>
+        </details>
+    '''
+
+
+def render_item_row(item, primary_field):
+    title = item_display_title(item, primary_field)
+    meta = " · ".join(item_meta_parts(item))
+    meta_html = f'<div class="item-meta">{html_escape(meta)}</div>' if meta else ""
+
+    return f'''
+        <li class="item-row">
+            <div class="item-row-main">
+                <div class="item-copy">
+                    <div class="item-title-line">
+                        <strong>{html_escape(title)}</strong>
+                        {render_status_pill(item)}
+                    </div>
+                    {meta_html}
+                </div>
+                {render_item_actions(item)}
+            </div>
+            {render_evidence_details(item)}
+        </li>
+    '''
+
+
 def render_item_list(items, primary_field):
     if not items:
-        return '<p class="muted">None</p>'
+        return '<p class="muted compact-empty">None</p>'
 
-    hidden_fields = {"id", "item_type"}
-    parts = ['<ol>']
+    rows = [render_item_row(item, primary_field) for item in items]
+    return '<ol class="compact-item-list">' + ''.join(rows) + '</ol>'
 
-    for item in items:
-        primary_value = html_escape(item.get(primary_field, ""))
-        parts.append(f'<li><div class="item-title"><strong>{primary_value}</strong>{render_item_actions(item)}</div>')
-        detail_parts = []
 
-        for key, value in item.items():
-            if key == primary_field or key in hidden_fields or not value:
-                continue
+def render_section_if_items(title, items, primary_field):
+    if not items:
+        return ""
 
-            label = html_escape(key.replace("_", " ").title())
-            detail_parts.append(f'<div><span class="label">{label}:</span> {html_escape(value)}</div>')
-
-        if detail_parts:
-            parts.append('<div class="details">' + "".join(detail_parts) + '</div>')
-
-        parts.append('</li>')
-
-    parts.append('</ol>')
-    return "".join(parts)
+    return f'''
+        <section class="card-section">
+            <h3>{html_escape(title)}</h3>
+            {render_item_list(items, primary_field)}
+        </section>
+    '''
 
 
 def render_dashboard_risks(risks):
     if not risks:
         return """
-            <section class="risk-section">
-                <div class="risk-header">
+            <section class="risk-section review-section">
+                <div class="section-header">
                     <div>
-                        <h2>Risks</h2>
+                        <h2>Needs review</h2>
                         <p class="meta">No current risks based on saved dashboard items.</p>
                     </div>
                     <span class="badge muted-badge">0 active</span>
@@ -3015,13 +3100,9 @@ def render_dashboard_risks(risks):
             if source_url else '<span class="muted">No source URL</span>'
         )
         item = risk.get("item", {})
-        reasons = "".join(
-            f'<li>{html_escape(reason)}</li>'
-            for reason in risk.get("reasons", [])
-        )
+        reasons = "".join(f'<li>{html_escape(reason)}</li>' for reason in risk.get("reasons", []))
         summary = html_escape(risk.get("analysis_summary", ""))
         summary_line = f'<p class="risk-summary">{summary}</p>' if summary else ""
-
         cards.append(f"""
             <article class="risk-card">
                 <div class="risk-card-main">
@@ -3037,68 +3118,68 @@ def render_dashboard_risks(risks):
         """)
 
     return f"""
-        <section class="risk-section">
-            <div class="risk-header">
+        <section class="risk-section review-section">
+            <div class="section-header">
                 <div>
-                    <h2>Risks</h2>
-                    <p class="meta">Items that may fall through the cracks based on saved Slack analyses.</p>
+                    <h2>Needs review</h2>
+                    <p class="meta">Risks, blockers, and untracked work that may need attention.</p>
                 </div>
                 <span class="badge risk-badge">{len(risks)} active</span>
             </div>
-            <div class="risk-grid">
-                {''.join(cards)}
-            </div>
+            <div class="risk-grid">{''.join(cards)}</div>
         </section>
     """
 
 
+def dashboard_search_url(item_filter, search_query=""):
+    base = f"/dashboard?filter={quote(clean_text(item_filter) or 'all')}"
+    search_query = clean_text(search_query)
+    if search_query:
+        base += f"&q={quote(search_query)}"
+    return base
 
 
-def render_dashboard_filter_tabs(active_filter="all"):
+def render_dashboard_filter_tabs(active_filter="all", search_query=""):
     active_filter = normalize_dashboard_filter(active_filter)
-    filters = [
-        ("all", "All"),
-        ("risks", "Risks"),
-        ("new", "New"),
-        ("tracked", "Tracked"),
-        ("snoozed", "Snoozed"),
-        ("ignored", "Ignored"),
-    ]
+    filters = [("all", "All"), ("risks", "Risks"), ("new", "New"), ("tracked", "Tracked"), ("snoozed", "Snoozed"), ("ignored", "Ignored")]
     links = []
-
     for value, label in filters:
         active_class = " active-filter" if value == active_filter else ""
-        links.append(
-            f'<a class="filter-link{active_class}" href="/dashboard?filter={html_escape(value)}">{html_escape(label)}</a>'
-        )
-
+        links.append(f'<a class="filter-link{active_class}" href="{html_escape(dashboard_search_url(value, search_query))}">{html_escape(label)}</a>')
     return '<nav class="filter-tabs">' + "".join(links) + '</nav>'
+
+
+def render_dashboard_search_form(search_query="", item_filter="all"):
+    return f'''
+        <form class="dashboard-search" method="get" action="/dashboard">
+            <input type="hidden" name="filter" value="{html_escape(normalize_dashboard_filter(item_filter))}">
+            <label>
+                Search dashboard
+                <input name="q" type="search" value="{html_escape(search_query)}" placeholder="Search summary, item, assignee, FLO ID">
+            </label>
+            <button type="submit">Search</button>
+            <a class="clear-search" href="/dashboard?filter={html_escape(normalize_dashboard_filter(item_filter))}">Clear</a>
+        </form>
+    '''
 
 
 def render_channel_scan_history(limit=5):
     scans = get_recent_channel_scan_history(limit)
-
     if not scans:
         return ""
-
     rows = []
-
     for scan in scans:
-        force_label = " · force rescan" if scan.get("force_rescan") else ""
+        force_label = " · force" if scan.get("force_rescan") else ""
         rows.append(
             "<li>"
             f"<strong>{html_escape(scan.get('channel_id', ''))}</strong>"
-            f" · {html_escape(scan.get('created_at', ''))}"
-            f" · {html_escape(scan.get('lookback_hours', ''))}h{force_label}"
-            f" · found {html_escape(scan.get('threads_found', 0))}"
-            f", analyzed {html_escape(scan.get('analyzed', 0))}"
-            f", skipped {html_escape(scan.get('skipped_existing', 0))}"
-            f", failed {html_escape(scan.get('failed', 0))}"
+            f"<span>{html_escape(scan.get('created_at', ''))}</span>"
+            f"<span>{html_escape(scan.get('lookback_hours', ''))}h{force_label}</span>"
+            f"<span>found {html_escape(scan.get('threads_found', 0))}, analyzed {html_escape(scan.get('analyzed', 0))}, skipped {html_escape(scan.get('skipped_existing', 0))}, failed {html_escape(scan.get('failed', 0))}</span>"
             "</li>"
         )
-
     return f"""
-        <section class="scan-history-section">
+        <section class="scan-history-section sidebar-panel">
             <h2>Recent scans</h2>
             <ol class="scan-history-list">{''.join(rows)}</ol>
         </section>
@@ -3106,94 +3187,130 @@ def render_channel_scan_history(limit=5):
 
 
 def render_scan_channel_form(scan_result=""):
-    result_html = (
-        f'<div class="scan-result">{html_escape(scan_result)}</div>'
-        if scan_result else ""
-    )
-
+    result_html = f'<div class="scan-result">{html_escape(scan_result)}</div>' if scan_result else ""
     return f"""
-        <section class="scan-section">
+        <section class="scan-section sidebar-panel">
             <div>
                 <h2>Scan channel</h2>
-                <p class="meta">Analyze recent Slack thread parents in a channel. Existing saved threads are skipped unless force rescan is checked.</p>
+                <p class="meta">Scan new and changed Slack threads. Use force rescan when you want to refresh everything.</p>
             </div>
             <form class="scan-form" method="post" action="/dashboard/scan-channel">
-                <label>
-                    Channel ID
-                    <input name="channel_id" type="text" placeholder="C1234567890" required>
-                </label>
-                <label>
-                    Lookback hours
-                    <input name="lookback_hours" type="number" min="1" max="168" value="24" required>
-                </label>
-                <label class="checkbox-label">
-                    <input name="force_rescan" type="checkbox" value="1">
-                    Force rescan existing threads
-                </label>
+                <label>Channel ID<input name="channel_id" type="text" placeholder="C1234567890" required></label>
+                <label>Lookback hours<input name="lookback_hours" type="number" min="1" max="168" value="24" required></label>
+                <label class="checkbox-label"><input name="force_rescan" type="checkbox" value="1"> Force rescan existing threads</label>
                 <button type="submit">Scan channel</button>
             </form>
             {result_html}
         </section>
     """
 
-def render_dashboard_html(scan_result="", item_filter="all"):
-    cards = []
+
+def entry_item_text(item):
+    return " ".join(clean_text(value) for value in item.values() if value)
+
+
+def entry_matches_search(entry, search_query=""):
+    search_query = normalize_name(search_query)
+    if not search_query:
+        return True
+    haystack_parts = [entry.get("source_key", ""), entry.get("source_url", ""), entry.get("summary", ""), entry.get("created_at", ""), entry.get("updated_at", "")]
+    for key in ["action_items", "unresolved_questions", "blockers", "proposed_issues"]:
+        for item in entry.get(key, []) or []:
+            haystack_parts.append(entry_item_text(item))
+    return search_query in normalize_name(" ".join(haystack_parts))
+
+
+def risk_matches_search(risk, search_query=""):
+    search_query = normalize_name(search_query)
+    if not search_query:
+        return True
+    haystack = " ".join([risk.get("title", ""), risk.get("analysis_summary", ""), risk.get("source_url", ""), " ".join(risk.get("reasons", []) or []), entry_item_text(risk.get("item", {}) or {})])
+    return search_query in normalize_name(haystack)
+
+
+def entry_counts(entry):
+    return {
+        "actions": len(entry.get("action_items", []) or []),
+        "issues": len(entry.get("proposed_issues", []) or []),
+        "questions": len(entry.get("unresolved_questions", []) or []),
+        "blockers": len(entry.get("blockers", []) or []),
+        "new": int(entry.get("createable_count", 0) or 0),
+        "tracked": int(entry.get("tracked_count", 0) or 0),
+    }
+
+
+def render_count_chips(counts):
+    chips = []
+    for key, label in [("new", "new"), ("tracked", "tracked"), ("actions", "actions"), ("issues", "issues"), ("questions", "questions"), ("blockers", "blockers")]:
+        value = counts.get(key, 0)
+        if value:
+            chips.append(f'<span class="count-chip">{html_escape(value)} {html_escape(label)}</span>')
+    if not chips:
+        chips.append('<span class="count-chip muted-chip">no visible items</span>')
+    return '<div class="count-chips">' + ''.join(chips) + '</div>'
+
+
+def render_thread_card(entry, open_by_default=False):
+    source_url = entry.get("source_url", "")
+    source_link = f'<a href="{html_escape(source_url)}" target="_blank" rel="noreferrer">Open Slack thread</a>' if source_url else '<span class="muted">No source URL</span>'
+    open_attr = " open" if open_by_default else ""
+    freshness = []
+    if entry.get("reply_count") is not None:
+        freshness.append(f"{entry.get('reply_count')} replies")
+    if entry.get("last_scanned_at"):
+        freshness.append(f"last scanned {entry.get('last_scanned_at')}")
+    freshness_html = f'<p class="meta card-freshness">{" · ".join(html_escape(part) for part in freshness)}</p>' if freshness else ""
+    sections = "".join([
+        render_section_if_items("Action items", entry.get("action_items", []), "task"),
+        render_section_if_items("Proposed Linear issues", entry.get("proposed_issues", []), "title"),
+        render_section_if_items("Unresolved questions", entry.get("unresolved_questions", []), "question"),
+        render_section_if_items("Blockers", entry.get("blockers", []), "blocker"),
+    ]) or '<p class="muted">No visible items in this filter.</p>'
+    return f'''
+        <details class="card thread-card"{open_attr}>
+            <summary class="thread-summary">
+                <div class="summary-main">
+                    <h2>{html_escape(entry.get('summary', 'No summary available.'))}</h2>
+                    <p class="meta">{html_escape(entry.get('updated_at', '') or entry.get('created_at', ''))} · {source_link}</p>
+                    {freshness_html}
+                </div>
+                {render_count_chips(entry_counts(entry))}
+            </summary>
+            <div class="thread-body">{sections}</div>
+        </details>
+    '''
+
+
+def render_dashboard_html(scan_result="", item_filter="all", search_query=""):
     item_filter = normalize_dashboard_filter(item_filter)
-    risks = get_dashboard_risks()
+    search_query = clean_text(search_query)
+    risks = [risk for risk in get_dashboard_risks() if risk_matches_search(risk, search_query)]
     risk_html = render_dashboard_risks(risks) if item_filter in {"all", "risks"} else ""
-    filter_tabs_html = render_dashboard_filter_tabs(item_filter)
+    filter_tabs_html = render_dashboard_filter_tabs(item_filter, search_query)
+    search_html = render_dashboard_search_form(search_query, item_filter)
     scan_history_html = render_channel_scan_history()
-
     entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter)
-
-    for entry in entries:
-        source_url = entry.get("source_url", "")
-        source_link = (
-            f'<a href="{html_escape(source_url)}" target="_blank" rel="noreferrer">Open Slack thread</a>'
-            if source_url else '<span class="muted">No source URL</span>'
-        )
-        createable_count = entry.get("createable_count", 0)
-        tracked_count = entry.get("tracked_count", 0)
-        status = (
-            f'{createable_count} new, {tracked_count} tracked'
-            if createable_count or tracked_count else 'no proposed issues'
-        )
-
-        cards.append(f"""
-            <article class="card">
-                <div class="card-header">
-                    <div>
-                        <h2>{html_escape(entry.get('summary', 'No summary available.'))}</h2>
-                        <p class="meta">{html_escape(entry.get('created_at', ''))} · {source_link}</p>
-                    </div>
-                    <span class="badge">{html_escape(status)}</span>
-                </div>
-
-                <div class="grid">
-                    <section>
-                        <h3>Action items</h3>
-                        {render_item_list(entry.get('action_items', []), 'task')}
-                    </section>
-                    <section>
-                        <h3>Proposed Linear issues</h3>
-                        {render_item_list(entry.get('proposed_issues', []), 'title')}
-                    </section>
-                </div>
-
-                <section>
-                    <h3>Unresolved questions</h3>
-                    {render_item_list(entry.get('unresolved_questions', []), 'question')}
-                </section>
-            </article>
-        """)
-
-    if not cards:
+    entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
+    cards = [render_thread_card(entry, open_by_default=False) for entry in entries]
+    if not cards and item_filter != "risks":
         cards.append("""
             <article class="card empty">
                 <h2>No matching dashboard items</h2>
                 <p>Run the Slack message shortcut or scan a channel, then refresh this page. Saved analyses will stay after a server restart.</p>
             </article>
         """)
+    history_html = f'''
+        <section class="history-section">
+            <div class="section-header">
+                <div>
+                    <h2>Recent thread history</h2>
+                    <p class="meta">Cards are collapsed by default. Expand one when you need evidence or item controls.</p>
+                </div>
+                <span class="badge muted-badge">{len(entries)} shown</span>
+            </div>
+            {''.join(cards)}
+        </section>
+    ''' if item_filter != "risks" else ""
 
     return f"""
     <!doctype html>
@@ -3203,69 +3320,94 @@ def render_dashboard_html(scan_result="", item_filter="all"):
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Slack Linear Dashboard</title>
         <style>
-            body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; color: #1f2937; }}
-            header {{ padding: 28px 36px; background: white; border-bottom: 1px solid #e5e7eb; }}
+            :root {{ --border: #e5e7eb; --muted: #6b7280; --blue: #2563eb; --bg: #f6f7f9; }}
+            * {{ box-sizing: border-box; }}
+            body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: #1f2937; }}
+            header {{ padding: 26px 36px; background: white; border-bottom: 1px solid var(--border); }}
             h1 {{ margin: 0 0 8px; font-size: 28px; }}
             h2 {{ margin: 0; font-size: 18px; }}
-            h3 {{ margin: 18px 0 8px; font-size: 14px; text-transform: uppercase; letter-spacing: .04em; color: #4b5563; }}
-            main {{ padding: 24px 36px 48px; max-width: 1100px; }}
+            h3 {{ margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #4b5563; }}
+            main {{ padding: 24px 36px 48px; max-width: 1280px; }}
             .dashboard-layout {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 22px; align-items: start; }}
             .dashboard-sidebar {{ position: sticky; top: 18px; display: flex; flex-direction: column; gap: 16px; }}
             .dashboard-content {{ min-width: 0; }}
-            .scan-section {{ background: white; border: 1px solid #dbeafe; border-radius: 18px; padding: 22px; margin-bottom: 0; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
-            .scan-form {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin-top: 14px; }}
-            .scan-form label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
-            .scan-form input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; min-width: 170px; font-size: 14px; }}
-            .scan-form input[type=checkbox] {{ min-width: 0; }}
-            .checkbox-label {{ flex-direction: row !important; align-items: center; padding-bottom: 8px; }}
-            .scan-form button {{ border: 1px solid #2563eb; background: #2563eb; color: white; border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; }}
-            .scan-form button:hover {{ background: #1d4ed8; }}
+            .sidebar-panel, .card, .risk-section, .history-section {{ background: white; border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
+            .scan-section, .scan-history-section {{ padding: 18px; }}
+            .scan-form {{ display: grid; gap: 12px; margin-top: 14px; }}
+            .scan-form label, .dashboard-search label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
+            .scan-form input, .dashboard-search input, .linear-reference-input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; font-size: 14px; width: 100%; }}
+            .scan-form input[type=checkbox] {{ width: auto; }}
+            .checkbox-label {{ flex-direction: row !important; align-items: center; }}
+            button {{ border: 1px solid var(--blue); background: var(--blue); color: white; border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; }}
+            button:hover {{ background: #1d4ed8; }}
             .scan-result {{ margin-top: 12px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; border-radius: 12px; padding: 10px 12px; font-size: 14px; }}
-            .filter-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
+            .filter-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
             .filter-link {{ border: 1px solid #d1d5db; background: white; color: #374151; border-radius: 999px; padding: 7px 11px; font-size: 14px; }}
-            .active-filter {{ border-color: #2563eb; background: #eff6ff; color: #1d4ed8; font-weight: 600; }}
-            .scan-history-section {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 18px 22px; margin-bottom: 0; }}
-            .scan-history-list {{ margin: 10px 0 0; padding-left: 20px; color: #4b5563; font-size: 14px; }}
-            .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
-            .card-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }}
-            .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }}
-            .meta, .muted {{ color: #6b7280; }}
+            .active-filter {{ border-color: var(--blue); background: #eff6ff; color: #1d4ed8; font-weight: 600; }}
+            .dashboard-search {{ display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: end; background: white; border: 1px solid var(--border); border-radius: 16px; padding: 14px; margin-bottom: 18px; }}
+            .clear-search {{ align-self: center; color: var(--muted); font-size: 14px; }}
+            .scan-history-list {{ list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; color: #4b5563; font-size: 13px; }}
+            .scan-history-list li {{ display: grid; gap: 2px; margin: 0; padding-bottom: 10px; border-bottom: 1px solid #f3f4f6; }}
+            .section-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 14px; }}
+            .history-section, .risk-section {{ padding: 18px; margin-bottom: 20px; }}
+            .card {{ margin-bottom: 14px; overflow: hidden; }}
+            .thread-card {{ padding: 0; }}
+            .thread-summary {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; padding: 18px; cursor: pointer; list-style: none; }}
+            .thread-summary::-webkit-details-marker {{ display: none; }}
+            .thread-summary::before {{ content: "▸"; color: var(--muted); margin-top: 2px; }}
+            .thread-card[open] .thread-summary::before {{ content: "▾"; }}
+            .summary-main {{ flex: 1; min-width: 0; }}
+            .thread-body {{ border-top: 1px solid #f3f4f6; padding: 18px; display: grid; gap: 16px; }}
+            .card-section {{ border: 1px solid #f3f4f6; border-radius: 14px; padding: 14px; background: #fcfcfd; }}
+            .meta, .muted {{ color: var(--muted); }}
             .meta {{ margin: 6px 0 0; font-size: 14px; }}
-            .badge {{ white-space: nowrap; background: #eef2ff; color: #3730a3; border-radius: 999px; padding: 6px 10px; font-size: 13px; font-weight: 600; }}
-            .muted-badge {{ background: #f3f4f6; color: #6b7280; }}
+            .badge, .count-chip, .status-pill {{ white-space: nowrap; border-radius: 999px; padding: 5px 9px; font-size: 12px; font-weight: 600; }}
+            .badge {{ background: #eef2ff; color: #3730a3; }}
+            .muted-badge, .muted-chip {{ background: #f3f4f6; color: var(--muted); }}
             .risk-badge {{ background: #fef3c7; color: #92400e; }}
-            .risk-section {{ background: #fff7ed; border: 1px solid #fed7aa; border-radius: 18px; padding: 22px; margin-bottom: 24px; }}
-            .risk-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 14px; }}
+            .count-chips {{ display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }}
+            .count-chip {{ background: #eef2ff; color: #3730a3; }}
+            .risk-section {{ background: #fff7ed; border-color: #fed7aa; }}
             .risk-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
             .risk-card {{ background: white; border: 1px solid #fed7aa; border-radius: 14px; padding: 16px; }}
             .risk-card h3 {{ margin-top: 0; text-transform: none; letter-spacing: 0; font-size: 16px; color: #1f2937; }}
             .risk-card-main {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }}
             .risk-summary {{ margin: 8px 0; color: #4b5563; font-size: 14px; }}
             .risk-reasons {{ margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 14px; }}
-            .item-title {{ display: flex; align-items: center; gap: 10px; justify-content: space-between; }}
+            .compact-item-list {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }}
+            .item-row {{ margin: 0; padding: 12px; background: white; border: 1px solid #edf0f3; border-radius: 12px; }}
+            .item-row-main {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }}
+            .item-copy {{ min-width: 0; }}
+            .item-title-line {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+            .item-meta {{ margin-top: 4px; color: var(--muted); font-size: 13px; }}
+            .status-new {{ background: #eff6ff; color: #1d4ed8; }}
+            .status-matched, .status-created {{ background: #ecfdf5; color: #047857; }}
+            .status-possible-duplicate {{ background: #fef3c7; color: #92400e; }}
+            .status-snoozed {{ background: #fef3c7; color: #92400e; }}
+            .status-ignored {{ background: #f3f4f6; color: var(--muted); }}
             .inline-form {{ display: inline; margin: 0; }}
             .item-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }}
             .track-form {{ display: inline-flex; gap: 6px; align-items: center; }}
-            .linear-reference-input {{ border: 1px solid #d1d5db; border-radius: 999px; padding: 3px 8px; font-size: 12px; width: 150px; }}
-            .ignore-button, .track-button, .snooze-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 3px 8px; font-size: 12px; cursor: pointer; }}
+            .linear-reference-input {{ border-radius: 999px; padding: 4px 8px; font-size: 12px; width: 150px; }}
+            .ignore-button, .track-button, .snooze-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 4px 8px; font-size: 12px; cursor: pointer; }}
             .ignore-button:hover, .track-button:hover, .snooze-button:hover {{ background: #f3f4f6; color: #111827; }}
             .track-button {{ border-color: #bfdbfe; color: #1d4ed8; }}
             .snooze-button {{ border-color: #fde68a; color: #92400e; }}
-            ol {{ margin: 0; padding-left: 20px; }}
-            li {{ margin-bottom: 12px; }}
-            .details {{ margin-top: 5px; color: #374151; font-size: 14px; line-height: 1.45; }}
-            .label {{ color: #6b7280; }}
-            a {{ color: #2563eb; text-decoration: none; }}
+            .item-details {{ margin-top: 8px; }}
+            .item-details summary {{ color: var(--muted); cursor: pointer; font-size: 13px; }}
+            .details {{ margin-top: 6px; color: #374151; font-size: 14px; line-height: 1.45; }}
+            .label {{ color: var(--muted); }}
+            a {{ color: var(--blue); text-decoration: none; }}
             a:hover {{ text-decoration: underline; }}
-            .empty {{ text-align: center; padding: 48px; }}
-            @media (max-width: 1000px) {{ .dashboard-layout {{ grid-template-columns: 1fr; }} .dashboard-sidebar {{ position: static; }} }}
-            @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .grid, .risk-grid {{ grid-template-columns: 1fr; }} .card-header, .risk-header {{ flex-direction: column; }} }}
+            .empty {{ text-align: center; padding: 42px; }}
+            @media (max-width: 1050px) {{ .dashboard-layout {{ grid-template-columns: 1fr; }} .dashboard-sidebar {{ position: static; }} }}
+            @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .dashboard-search {{ grid-template-columns: 1fr; }} .risk-grid {{ grid-template-columns: 1fr; }} .thread-summary, .section-header, .risk-card-main, .item-row-main {{ flex-direction: column; }} .count-chips, .item-actions {{ justify-content: flex-start; }} }}
         </style>
     </head>
     <body>
         <header>
             <h1>Slack Linear Dashboard</h1>
-            <p class="meta">Saved Slack thread analyses from SQLite. Refresh after running the Slack shortcut.</p>
+            <p class="meta">Review Slack work signals, track what is handled, and expand cards only when you need details.</p>
         </header>
         <main>
             <div class="dashboard-layout">
@@ -3275,15 +3417,15 @@ def render_dashboard_html(scan_result="", item_filter="all"):
                 </aside>
                 <section class="dashboard-content">
                     {filter_tabs_html}
+                    {search_html}
                     {risk_html}
-                    {''.join(cards)}
+                    {history_html}
                 </section>
             </div>
         </main>
     </body>
     </html>
     """
-
 
 def post_thread_analysis_preview(
     response_url,
@@ -3534,8 +3676,9 @@ def home():
 def dashboard(request: Request):
     scan_result = request.query_params.get("scan_result", "")
     item_filter = request.query_params.get("filter", "all")
+    search_query = request.query_params.get("q", "")
     return Response(
-        content=render_dashboard_html(scan_result, item_filter),
+        content=render_dashboard_html(scan_result, item_filter, search_query),
         media_type="text/html",
     )
 
