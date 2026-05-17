@@ -1320,6 +1320,73 @@ def check_github_for_detected_item(item_id):
 
 
 
+
+def github_check_candidate_items(search_query=""):
+    """Return visible tracked proposed issues that have a saved Linear identifier."""
+    search_query = clean_text(search_query)
+    entries = get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter="tracked")
+    entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
+    candidates = []
+    seen_ids = set()
+
+    for entry in entries:
+        for item in entry.get("proposed_issues", []) or []:
+            item_id = item.get("id")
+            linear_identifier = clean_text(item.get("linear_identifier", ""))
+            status = clean_text(item.get("status", ""))
+
+            if not item_id or item_id in seen_ids:
+                continue
+
+            if status not in {"created", "matched", "possible_duplicate"}:
+                continue
+
+            if not linear_identifier:
+                continue
+
+            seen_ids.add(item_id)
+            candidates.append(item)
+
+    return candidates
+
+
+def check_github_for_tracked_items(search_query=""):
+    candidates = github_check_candidate_items(search_query)
+    result = {
+        "checked": 0,
+        "found": 0,
+        "not_found": 0,
+        "error": 0,
+    }
+
+    for item in candidates:
+        lookup = check_github_for_detected_item(item["id"])
+        status = clean_text(lookup.get("status", ""))
+        result["checked"] += 1
+
+        if status == "found":
+            result["found"] += 1
+        elif status == "not_found":
+            result["not_found"] += 1
+        else:
+            result["error"] += 1
+
+    return result
+
+
+def format_bulk_github_result(result):
+    checked = int(result.get("checked", 0) or 0)
+
+    if checked <= 0:
+        return "No tracked Linear items with saved FLO IDs were available to check."
+
+    return (
+        f"Checked GitHub for {checked} tracked item(s): "
+        f"{int(result.get('found', 0) or 0)} found, "
+        f"{int(result.get('not_found', 0) or 0)} not found, "
+        f"{int(result.get('error', 0) or 0)} error."
+    )
+
 def fetch_slack_channel_messages(channel_id, lookback_hours=24, limit=100):
     channel_id = clean_text(channel_id)
 
@@ -3396,6 +3463,21 @@ def render_dashboard_notice(github_status="", github_identifier="", github_url="
     return f'<div class="dashboard-notice {css_class}">{html_escape(message)}{link}</div>'
 
 
+
+def render_bulk_github_notice(bulk_message=""):
+    bulk_message = clean_text(bulk_message)
+
+    if not bulk_message:
+        return ""
+
+    css_class = "notice-muted"
+    if "error" in normalize_name(bulk_message) and not bulk_message.startswith("No tracked"):
+        css_class = "notice-error"
+    elif "found" in normalize_name(bulk_message):
+        css_class = "notice-success"
+
+    return f'<div class="dashboard-notice {css_class}">{html_escape(bulk_message)}</div>'
+
 def dashboard_search_url(item_filter, search_query=""):
     base = f"/dashboard?filter={quote(clean_text(item_filter) or 'all')}"
     search_query = clean_text(search_query)
@@ -3427,6 +3509,17 @@ def render_dashboard_search_form(search_query="", item_filter="all"):
         </form>
     '''
 
+
+
+def render_bulk_github_check_form(search_query="", item_filter="all"):
+    return f'''
+        <form class="bulk-github-form" method="post" action="/dashboard/check-github-tracked">
+            <input type="hidden" name="filter" value="{html_escape(normalize_dashboard_filter(item_filter))}">
+            <input type="hidden" name="q" value="{html_escape(search_query)}">
+            <button type="submit" class="bulk-github-button">Check GitHub for tracked items</button>
+            <span class="meta">Checks tracked proposed issues with saved FLO IDs in the current dashboard view.</span>
+        </form>
+    '''
 
 def render_channel_scan_history(limit=5):
     scans = get_recent_channel_scan_history(limit)
@@ -3544,15 +3637,16 @@ def render_thread_card(entry, open_by_default=False):
     '''
 
 
-def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url=""):
+def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url="", github_bulk_result=""):
     item_filter = normalize_dashboard_filter(item_filter)
     search_query = clean_text(search_query)
     risks = [risk for risk in get_dashboard_risks() if risk_matches_search(risk, search_query)]
     risk_html = render_dashboard_risks(risks) if item_filter in {"all", "risks"} else ""
     filter_tabs_html = render_dashboard_filter_tabs(item_filter, search_query)
     search_html = render_dashboard_search_form(search_query, item_filter)
+    bulk_github_html = render_bulk_github_check_form(search_query, item_filter)
     scan_history_html = render_channel_scan_history()
-    notice_html = render_dashboard_notice(github_status, github_identifier, github_url)
+    notice_html = render_dashboard_notice(github_status, github_identifier, github_url) + render_bulk_github_notice(github_bulk_result)
     entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter)
     entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
     cards = [render_thread_card(entry, open_by_default=False) for entry in entries]
@@ -3612,7 +3706,10 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             .filter-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
             .filter-link {{ border: 1px solid #d1d5db; background: white; color: #374151; border-radius: 999px; padding: 7px 11px; font-size: 14px; }}
             .active-filter {{ border-color: var(--blue); background: #eff6ff; color: #1d4ed8; font-weight: 600; }}
-            .dashboard-search {{ display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: end; background: white; border: 1px solid var(--border); border-radius: 16px; padding: 14px; margin-bottom: 18px; }}
+            .dashboard-search {{ display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: end; background: white; border: 1px solid var(--border); border-radius: 16px; padding: 14px; margin-bottom: 12px; }}
+            .bulk-github-form {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: white; border: 1px solid var(--border); border-radius: 16px; padding: 12px 14px; margin-bottom: 18px; }}
+            .bulk-github-button {{ border-color: #16a34a; background: #16a34a; }}
+            .bulk-github-button:hover {{ background: #15803d; }}
             .clear-search {{ align-self: center; color: var(--muted); font-size: 14px; }}
             .scan-history-list {{ list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; color: #4b5563; font-size: 13px; }}
             .scan-history-list li {{ display: grid; gap: 2px; margin: 0; padding-bottom: 10px; border-bottom: 1px solid #f3f4f6; }}
@@ -3688,6 +3785,7 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
                     {notice_html}
                     {filter_tabs_html}
                     {search_html}
+                    {bulk_github_html}
                     {risk_html}
                     {history_html}
                 </section>
@@ -3950,6 +4048,7 @@ def dashboard(request: Request):
     github_status = request.query_params.get("github_status", "")
     github_identifier = request.query_params.get("github_identifier", "")
     github_url = request.query_params.get("github_url", "")
+    github_bulk_result = request.query_params.get("github_bulk_result", "")
     return Response(
         content=render_dashboard_html(
             scan_result,
@@ -3958,6 +4057,7 @@ def dashboard(request: Request):
             github_status=github_status,
             github_identifier=github_identifier,
             github_url=github_url,
+            github_bulk_result=github_bulk_result,
         ),
         media_type="text/html",
     )
@@ -4027,6 +4127,26 @@ def check_dashboard_item_github(item_id: int, request: Request):
 def snooze_dashboard_item(item_id: int, hours: int, request: Request):
     snooze_related_detected_items(item_id, hours)
     return Response(status_code=303, headers={"Location": dashboard_redirect_location(request)})
+
+
+@app.post("/dashboard/check-github-tracked")
+async def check_dashboard_tracked_items_github(request: Request):
+    form = await request.form()
+    item_filter = normalize_dashboard_filter(form.get("filter", "all"))
+    search_query = clean_text(form.get("q", ""))
+    result = check_github_for_tracked_items(search_query=search_query)
+    message = format_bulk_github_result(result)
+    query_params = {
+        "filter": item_filter,
+        "github_bulk_result": message,
+    }
+    if search_query:
+        query_params["q"] = search_query
+
+    return Response(
+        status_code=303,
+        headers={"Location": f"/dashboard?{urlencode(query_params)}"},
+    )
 
 
 @app.post("/slack/interactive")

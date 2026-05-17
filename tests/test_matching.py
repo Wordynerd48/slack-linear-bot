@@ -1841,3 +1841,141 @@ def test_dashboard_redirect_location_preserves_tracked_filter():
     assert location.startswith("/dashboard?filter=tracked&q=FLO-999")
     assert "github_status=not_found" in location
     assert "github_identifier=FLO-999" in location
+
+
+def test_github_check_candidate_items_returns_tracked_proposed_issues_with_linear_ids(temp_database):
+    source_key = "slack-thread:C123:bulk-candidates"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    fix_proposed = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(fix_proposed["id"], linear_reference="FLO-200")
+
+    candidates = main.github_check_candidate_items()
+
+    assert len(candidates) == 1
+    assert candidates[0]["id"] == fix_proposed["id"]
+    assert candidates[0]["linear_identifier"] == "FLO-200"
+
+
+def test_check_github_for_tracked_items_checks_all_tracked_candidates(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:bulk-check"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    fix_proposed = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    test_proposed = item_by_type_and_title(source_key, "proposed_issue", "test shipping")
+    main.mark_related_detected_items_tracked(fix_proposed["id"], linear_reference="FLO-200")
+    main.mark_related_detected_items_tracked(test_proposed["id"], linear_reference="FLO-201")
+
+    def fake_search(linear_identifier):
+        if linear_identifier == "FLO-200":
+            return {
+                "title": "FLO-200 Fix checkout persistence",
+                "url": "https://github.com/flow0178/slack-linear-bot/pull/200",
+                "state": "open",
+                "number": 200,
+            }
+        return None
+
+    monkeypatch.setattr(main, "search_github_pull_request_for_linear_identifier", fake_search)
+
+    result = main.check_github_for_tracked_items()
+
+    assert result == {
+        "checked": 2,
+        "found": 1,
+        "not_found": 1,
+        "error": 0,
+    }
+
+    updated_fix = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    updated_test = item_by_type_and_title(source_key, "proposed_issue", "test shipping")
+    assert updated_fix["github_status"] == "found"
+    assert updated_fix["github_url"] == "https://github.com/flow0178/slack-linear-bot/pull/200"
+    assert updated_test["github_status"] == "not_found"
+    assert updated_test["github_url"] == ""
+
+
+def test_check_github_for_tracked_items_counts_errors(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:bulk-error"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    fix_proposed = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(fix_proposed["id"], linear_reference="FLO-202")
+
+    def fake_search(linear_identifier):
+        raise RuntimeError("fake github failure")
+
+    monkeypatch.setattr(main, "search_github_pull_request_for_linear_identifier", fake_search)
+
+    result = main.check_github_for_tracked_items()
+
+    assert result == {
+        "checked": 1,
+        "found": 0,
+        "not_found": 0,
+        "error": 1,
+    }
+
+    updated = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    assert updated["github_status"] == "error"
+    assert updated["github_url"] == ""
+
+
+def test_check_github_for_tracked_items_respects_dashboard_search(temp_database, monkeypatch):
+    first_source_key = "slack-thread:C123:bulk-search-checkout"
+    second_source_key = "slack-thread:C123:bulk-search-profile"
+    first_analysis = saved_analysis(first_source_key)
+    second_analysis = saved_analysis(second_source_key)
+    second_analysis["summary"] = "Evan will fix profile persistence."
+    second_analysis["action_items"][0]["task"] = "fix profile page persistence"
+    second_analysis["proposed_issues"][0]["title"] = "fix profile page persistence"
+    second_analysis["proposed_issues"][0]["description"] = "fix profile page persistence"
+
+    main.save_thread_analysis(first_source_key, "https://example.slack.com/thread-1", first_analysis)
+    main.save_thread_analysis(second_source_key, "https://example.slack.com/thread-2", second_analysis)
+
+    first_proposed = item_by_type_and_title(first_source_key, "proposed_issue", "fix checkout")
+    second_proposed = item_by_type_and_title(second_source_key, "proposed_issue", "fix profile")
+    main.mark_related_detected_items_tracked(first_proposed["id"], linear_reference="FLO-203")
+    main.mark_related_detected_items_tracked(second_proposed["id"], linear_reference="FLO-204")
+
+    checked = []
+
+    def fake_check(item_id):
+        checked.append(item_id)
+        return {"status": "not_found", "url": "", "message": "No GitHub pull request found."}
+
+    monkeypatch.setattr(main, "check_github_for_detected_item", fake_check)
+
+    result = main.check_github_for_tracked_items(search_query="profile")
+
+    assert result["checked"] == 1
+    assert checked == [second_proposed["id"]]
+
+
+def test_format_bulk_github_result_and_notice_render():
+    message = main.format_bulk_github_result({
+        "checked": 3,
+        "found": 1,
+        "not_found": 1,
+        "error": 1,
+    })
+    html = main.render_dashboard_html(github_bulk_result=message)
+
+    assert message == "Checked GitHub for 3 tracked item(s): 1 found, 1 not found, 1 error."
+    assert message in html
+    assert "dashboard-notice" in html
+
+
+def test_dashboard_renders_bulk_github_check_form(temp_database):
+    source_key = "slack-thread:C123:bulk-form"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-205")
+
+    html = main.render_dashboard_html(item_filter="tracked", search_query="checkout")
+
+    assert 'action="/dashboard/check-github-tracked"' in html
+    assert "Check GitHub for tracked items" in html
+    assert 'name="filter" value="tracked"' in html
+    assert 'name="q" value="checkout"' in html
