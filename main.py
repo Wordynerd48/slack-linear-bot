@@ -9,7 +9,7 @@ import sqlite3
 import time
 import uuid
 from datetime import date, datetime, timedelta
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from difflib import SequenceMatcher
 
 import requests
@@ -34,6 +34,10 @@ LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 LINEAR_TEAM_ID = os.getenv("LINEAR_TEAM_ID")
 LINEAR_API_URL = "https://api.linear.app/graphql"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "")
+GITHUB_API_URL = "https://api.github.com"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "slack_linear.db")
 PENDING_THREAD_PREVIEWS = {}
 CREATED_THREAD_ISSUES_BY_SOURCE_KEY = {}
@@ -106,6 +110,9 @@ def init_database():
                 existing_issue_match TEXT,
                 existing_issue_match_type TEXT,
                 snoozed_until TEXT,
+                github_status TEXT,
+                github_url TEXT,
+                github_checked_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (analysis_id) REFERENCES thread_analyses(id) ON DELETE CASCADE
@@ -119,6 +126,15 @@ def init_database():
 
         if "snoozed_until" not in existing_columns:
             connection.execute("ALTER TABLE detected_items ADD COLUMN snoozed_until TEXT")
+
+        if "github_status" not in existing_columns:
+            connection.execute("ALTER TABLE detected_items ADD COLUMN github_status TEXT")
+
+        if "github_url" not in existing_columns:
+            connection.execute("ALTER TABLE detected_items ADD COLUMN github_url TEXT")
+
+        if "github_checked_at" not in existing_columns:
+            connection.execute("ALTER TABLE detected_items ADD COLUMN github_checked_at TEXT")
 
         connection.execute(
             """
@@ -177,7 +193,8 @@ def previous_item_state_map(connection, analysis_id):
     rows = connection.execute(
         """
         SELECT item_type, title, status, linear_identifier, linear_url,
-               existing_issue_match, existing_issue_match_type, snoozed_until
+               existing_issue_match, existing_issue_match_type, snoozed_until,
+               github_status, github_url, github_checked_at
         FROM detected_items
         WHERE analysis_id = ?
         """,
@@ -196,6 +213,9 @@ def previous_item_state_map(connection, analysis_id):
             "existing_issue_match": row["existing_issue_match"] or "",
             "existing_issue_match_type": row["existing_issue_match_type"] or "",
             "snoozed_until": row["snoozed_until"] or "",
+            "github_status": row["github_status"] or "",
+            "github_url": row["github_url"] or "",
+            "github_checked_at": row["github_checked_at"] or "",
         }
 
     return state
@@ -415,6 +435,9 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
     linear_url = clean_text(item.get("existing_issue_url", ""))
     linear_identifier = linear_identifier_from_match(existing_match)
     snoozed_until = clean_text(item.get("snoozed_until", ""))
+    github_status = clean_text(item.get("github_status", ""))
+    github_url = clean_text(item.get("github_url", ""))
+    github_checked_at = clean_text(item.get("github_checked_at", ""))
 
     if item_type == "proposed_issue":
         if existing_match_type == "already_tracked":
@@ -442,6 +465,9 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
         existing_match = existing_match or old_state.get("existing_issue_match", "")
         existing_match_type = existing_match_type or old_state.get("existing_issue_match_type", "")
         snoozed_until = snoozed_until or old_state.get("snoozed_until", "")
+        github_status = github_status or old_state.get("github_status", "")
+        github_url = github_url or old_state.get("github_url", "")
+        github_checked_at = github_checked_at or old_state.get("github_checked_at", "")
 
     if item_type == "proposed_issue":
         item["status"] = status
@@ -461,14 +487,24 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
         if snoozed_until:
             item["snoozed_until"] = snoozed_until
 
+        if github_status:
+            item["github_status"] = github_status
+
+        if github_url:
+            item["github_url"] = github_url
+
+        if github_checked_at:
+            item["github_checked_at"] = github_checked_at
+
     cursor = connection.execute(
         """
         INSERT INTO detected_items (
             analysis_id, item_type, title, description, assignee_name, due_date,
             priority, evidence, status, linear_identifier, linear_url,
-            existing_issue_match, existing_issue_match_type, snoozed_until, created_at, updated_at
+            existing_issue_match, existing_issue_match_type, snoozed_until,
+            github_status, github_url, github_checked_at, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             analysis_id,
@@ -485,6 +521,9 @@ def insert_detected_item(connection, analysis_id, item_type, item, now, previous
             existing_match,
             existing_match_type,
             snoozed_until,
+            github_status,
+            github_url,
+            github_checked_at,
             now,
             now,
         ),
@@ -944,6 +983,9 @@ def detected_item_to_dashboard_dict(item):
         "existing_issue_match",
         "existing_issue_match_type",
         "snoozed_until",
+        "github_status",
+        "github_url",
+        "github_checked_at",
     ]
 
     for field in optional_fields:
@@ -1131,6 +1173,149 @@ def slack_api_get(endpoint, params=None):
         raise RuntimeError(f"Slack API error from {endpoint}: {data}")
 
     return data
+
+
+
+def require_github_config():
+    missing = []
+    if not GITHUB_TOKEN:
+        missing.append("GITHUB_TOKEN")
+    if not GITHUB_OWNER:
+        missing.append("GITHUB_OWNER")
+    if not GITHUB_REPO:
+        missing.append("GITHUB_REPO")
+
+    if missing:
+        raise RuntimeError(f"Missing GitHub configuration: {', '.join(missing)}")
+
+
+def github_api_get(endpoint, params=None):
+    require_github_config()
+    response = requests.get(
+        f"{GITHUB_API_URL}/{endpoint.lstrip('/')}",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        params=params or {},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def github_pull_request_search_query(linear_identifier):
+    linear_identifier = clean_text(linear_identifier).upper()
+    if not linear_identifier:
+        return ""
+
+    return f'repo:{GITHUB_OWNER}/{GITHUB_REPO} is:pr {linear_identifier} in:title,body'
+
+
+def search_github_pull_request_for_linear_identifier(linear_identifier):
+    query = github_pull_request_search_query(linear_identifier)
+    if not query:
+        return None
+
+    data = github_api_get(
+        "search/issues",
+        {
+            "q": query,
+            "sort": "updated",
+            "order": "desc",
+            "per_page": 1,
+        },
+    )
+    items = data.get("items", []) or []
+
+    if not items:
+        return None
+
+    item = items[0]
+    return {
+        "title": item.get("title", ""),
+        "url": item.get("html_url", ""),
+        "state": item.get("state", ""),
+        "number": item.get("number", ""),
+    }
+
+
+def update_detected_item_github_result(item_id, github_status, github_url=""):
+    """Save the latest GitHub lookup result and mirror it to paired rows.
+
+    A manual GitHub check should always overwrite stale results. If a previous
+    lookup found a PR, a later not_found or error result must clear the old URL
+    so the dashboard does not keep showing a stale success.
+    """
+    now = current_timestamp()
+    github_status = clean_text(github_status)
+    github_url = clean_text(github_url) if github_status == "found" else ""
+
+    with get_database_connection() as connection:
+        selected = connection.execute(
+            "SELECT * FROM detected_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+
+        if not selected:
+            return
+
+        item_ids = [item_id]
+        selected_type = selected["item_type"]
+
+        if selected_type == "action_item":
+            related_types = ["proposed_issue"]
+        elif selected_type == "proposed_issue":
+            related_types = ["action_item"]
+        else:
+            related_types = []
+
+        for candidate in matching_related_detected_items(connection, selected, related_types):
+            item_ids.append(candidate["id"])
+
+        connection.executemany(
+            """
+            UPDATE detected_items
+            SET github_status = ?, github_url = ?, github_checked_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            [(github_status, github_url, now, now, related_item_id) for related_item_id in item_ids],
+        )
+        connection.commit()
+
+
+def check_github_for_detected_item(item_id):
+    init_database()
+    with get_database_connection() as connection:
+        item = connection.execute(
+            "SELECT * FROM detected_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+
+    if not item:
+        return {"status": "error", "url": "", "message": "Dashboard item not found."}
+
+    linear_identifier = clean_text(item["linear_identifier"] or "")
+
+    if not linear_identifier:
+        update_detected_item_github_result(item_id, "error", "")
+        return {"status": "error", "url": "", "message": "No Linear identifier saved on this item."}
+
+    try:
+        match = search_github_pull_request_for_linear_identifier(linear_identifier)
+    except Exception as error:
+        logger.exception("GitHub lookup failed for Linear identifier %s", linear_identifier)
+        update_detected_item_github_result(item_id, "error", "")
+        return {"status": "error", "url": "", "message": str(error)}
+
+    if match:
+        github_url = match.get("url", "")
+        update_detected_item_github_result(item_id, "found", github_url)
+        return {"status": "found", "url": github_url, "message": "GitHub pull request found."}
+
+    update_detected_item_github_result(item_id, "not_found", "")
+    return {"status": "not_found", "url": "", "message": "No GitHub pull request found."}
 
 
 
@@ -2950,9 +3135,25 @@ def render_snooze_button(item, hours=24):
     """
 
 
+
+def render_github_check_button(item):
+    item_id = item.get("id")
+    linear_identifier = clean_text(item.get("linear_identifier", ""))
+
+    if not item_id or not linear_identifier:
+        return ""
+
+    return f"""
+        <form class="inline-form" method="post" action="/dashboard/items/{html_escape(item_id)}/check-github">
+            <button type="submit" class="github-button">Check GitHub</button>
+        </form>
+    """
+
+
 def render_item_actions(item):
     actions = [
         render_mark_tracked_button(item),
+        render_github_check_button(item),
         render_snooze_button(item, 24),
         render_ignore_button(item),
     ]
@@ -2986,6 +3187,7 @@ def item_meta_parts(item):
     priority = clean_text(item.get("priority", ""))
     due_date = clean_text(item.get("due_date", ""))
     linear_identifier = clean_text(item.get("linear_identifier", ""))
+    github_status = clean_text(item.get("github_status", ""))
 
     if assignee:
         parts.append(assignee)
@@ -2995,6 +3197,8 @@ def item_meta_parts(item):
         parts.append(f"due {due_date}")
     if linear_identifier:
         parts.append(linear_identifier)
+    if github_status:
+        parts.append(f"GitHub: {github_status.replace('_', ' ')}")
 
     return parts
 
@@ -3010,6 +3214,9 @@ def render_evidence_details(item):
     description = clean_text(item.get("description", ""))
     existing_match = clean_text(item.get("existing_issue_match", ""))
     linear_url = clean_text(item.get("linear_url", ""))
+    github_status = clean_text(item.get("github_status", ""))
+    github_url = clean_text(item.get("github_url", ""))
+    github_checked_at = clean_text(item.get("github_checked_at", ""))
     snoozed_until = clean_text(item.get("snoozed_until", ""))
     rows = []
 
@@ -3019,6 +3226,14 @@ def render_evidence_details(item):
         rows.append(f'<div><span class="label">Linear:</span> {html_escape(existing_match)}</div>')
     elif linear_url:
         rows.append(f'<div><span class="label">Linear:</span> <a href="{html_escape(linear_url)}" target="_blank" rel="noreferrer">{html_escape(linear_url)}</a></div>')
+    if github_status:
+        github_label = github_status.replace("_", " ")
+        if github_url:
+            rows.append(f'<div><span class="label">GitHub:</span> {html_escape(github_label)} · <a href="{html_escape(github_url)}" target="_blank" rel="noreferrer">Open pull request</a></div>')
+        else:
+            rows.append(f'<div><span class="label">GitHub:</span> {html_escape(github_label)}</div>')
+    if github_checked_at:
+        rows.append(f'<div><span class="label">GitHub checked:</span> {html_escape(github_checked_at)}</div>')
     if snoozed_until:
         rows.append(f'<div><span class="label">Snoozed until:</span> {html_escape(snoozed_until)}</div>')
     if evidence:
@@ -3131,6 +3346,56 @@ def render_dashboard_risks(risks):
     """
 
 
+def dashboard_redirect_location(request, extra_params=None):
+    extra_params = extra_params or {}
+    referer = request.headers.get("referer", "")
+    host_prefix = f"{request.url.scheme}://{request.url.netloc}"
+
+    if referer.startswith(host_prefix):
+        location = referer[len(host_prefix):]
+    elif referer.startswith("/dashboard"):
+        location = referer
+    else:
+        location = "/dashboard"
+
+    if not location.startswith("/dashboard"):
+        location = "/dashboard"
+
+    if extra_params:
+        separator = "&" if "?" in location else "?"
+        location = f"{location}{separator}{urlencode(extra_params)}"
+
+    return location
+
+
+def render_dashboard_notice(github_status="", github_identifier="", github_url=""):
+    github_status = clean_text(github_status)
+    github_identifier = clean_text(github_identifier)
+    github_url = clean_text(github_url)
+
+    if not github_status:
+        return ""
+
+    if github_status == "found":
+        message = f"GitHub pull request found for {github_identifier}." if github_identifier else "GitHub pull request found."
+        link = f' <a href="{html_escape(github_url)}" target="_blank" rel="noreferrer">Open pull request</a>' if github_url else ""
+        css_class = "notice-success"
+    elif github_status == "not_found":
+        message = f"No GitHub pull request found for {github_identifier}." if github_identifier else "No GitHub pull request found."
+        link = ""
+        css_class = "notice-muted"
+    elif github_status == "error":
+        message = f"GitHub lookup failed for {github_identifier}. Check GitHub repo settings and token permissions." if github_identifier else "GitHub lookup failed. Check GitHub repo settings and token permissions."
+        link = ""
+        css_class = "notice-error"
+    else:
+        message = github_status
+        link = ""
+        css_class = "notice-muted"
+
+    return f'<div class="dashboard-notice {css_class}">{html_escape(message)}{link}</div>'
+
+
 def dashboard_search_url(item_filter, search_query=""):
     base = f"/dashboard?filter={quote(clean_text(item_filter) or 'all')}"
     search_query = clean_text(search_query)
@@ -3230,7 +3495,6 @@ def risk_matches_search(risk, search_query=""):
 
 def entry_counts(entry):
     return {
-        "actions": len(entry.get("action_items", []) or []),
         "issues": len(entry.get("proposed_issues", []) or []),
         "questions": len(entry.get("unresolved_questions", []) or []),
         "blockers": len(entry.get("blockers", []) or []),
@@ -3241,7 +3505,7 @@ def entry_counts(entry):
 
 def render_count_chips(counts):
     chips = []
-    for key, label in [("new", "new"), ("tracked", "tracked"), ("actions", "actions"), ("issues", "issues"), ("questions", "questions"), ("blockers", "blockers")]:
+    for key, label in [("new", "new"), ("tracked", "tracked"), ("issues", "issues"), ("questions", "questions"), ("blockers", "blockers")]:
         value = counts.get(key, 0)
         if value:
             chips.append(f'<span class="count-chip">{html_escape(value)} {html_escape(label)}</span>')
@@ -3261,11 +3525,10 @@ def render_thread_card(entry, open_by_default=False):
         freshness.append(f"last scanned {entry.get('last_scanned_at')}")
     freshness_html = f'<p class="meta card-freshness">{" · ".join(html_escape(part) for part in freshness)}</p>' if freshness else ""
     sections = "".join([
-        render_section_if_items("Action items", entry.get("action_items", []), "task"),
         render_section_if_items("Proposed Linear issues", entry.get("proposed_issues", []), "title"),
         render_section_if_items("Unresolved questions", entry.get("unresolved_questions", []), "question"),
         render_section_if_items("Blockers", entry.get("blockers", []), "blocker"),
-    ]) or '<p class="muted">No visible items in this filter.</p>'
+    ]) or '<p class="muted">No visible dashboard items in this filter.</p>'
     return f'''
         <details class="card thread-card"{open_attr}>
             <summary class="thread-summary">
@@ -3281,7 +3544,7 @@ def render_thread_card(entry, open_by_default=False):
     '''
 
 
-def render_dashboard_html(scan_result="", item_filter="all", search_query=""):
+def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url=""):
     item_filter = normalize_dashboard_filter(item_filter)
     search_query = clean_text(search_query)
     risks = [risk for risk in get_dashboard_risks() if risk_matches_search(risk, search_query)]
@@ -3289,6 +3552,7 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query=""):
     filter_tabs_html = render_dashboard_filter_tabs(item_filter, search_query)
     search_html = render_dashboard_search_form(search_query, item_filter)
     scan_history_html = render_channel_scan_history()
+    notice_html = render_dashboard_notice(github_status, github_identifier, github_url)
     entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter)
     entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
     cards = [render_thread_card(entry, open_by_default=False) for entry in entries]
@@ -3341,6 +3605,10 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query=""):
             button {{ border: 1px solid var(--blue); background: var(--blue); color: white; border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; }}
             button:hover {{ background: #1d4ed8; }}
             .scan-result {{ margin-top: 12px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; border-radius: 12px; padding: 10px 12px; font-size: 14px; }}
+            .dashboard-notice {{ margin-bottom: 14px; border-radius: 14px; padding: 12px 14px; font-size: 14px; border: 1px solid var(--border); }}
+            .notice-success {{ background: #ecfdf5; border-color: #bbf7d0; color: #047857; }}
+            .notice-muted {{ background: #f8fafc; border-color: #e5e7eb; color: #475569; }}
+            .notice-error {{ background: #fef2f2; border-color: #fecaca; color: #b91c1c; }}
             .filter-tabs {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
             .filter-link {{ border: 1px solid #d1d5db; background: white; color: #374151; border-radius: 999px; padding: 7px 11px; font-size: 14px; }}
             .active-filter {{ border-color: var(--blue); background: #eff6ff; color: #1d4ed8; font-weight: 600; }}
@@ -3389,9 +3657,10 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query=""):
             .item-actions {{ display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }}
             .track-form {{ display: inline-flex; gap: 6px; align-items: center; }}
             .linear-reference-input {{ border-radius: 999px; padding: 4px 8px; font-size: 12px; width: 150px; }}
-            .ignore-button, .track-button, .snooze-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 4px 8px; font-size: 12px; cursor: pointer; }}
-            .ignore-button:hover, .track-button:hover, .snooze-button:hover {{ background: #f3f4f6; color: #111827; }}
+            .ignore-button, .track-button, .snooze-button, .github-button {{ border: 1px solid #d1d5db; background: #fff; color: #4b5563; border-radius: 999px; padding: 4px 8px; font-size: 12px; cursor: pointer; }}
+            .ignore-button:hover, .track-button:hover, .snooze-button:hover, .github-button:hover {{ background: #f3f4f6; color: #111827; }}
             .track-button {{ border-color: #bfdbfe; color: #1d4ed8; }}
+            .github-button {{ border-color: #bbf7d0; color: #047857; }}
             .snooze-button {{ border-color: #fde68a; color: #92400e; }}
             .item-details {{ margin-top: 8px; }}
             .item-details summary {{ color: var(--muted); cursor: pointer; font-size: 13px; }}
@@ -3416,6 +3685,7 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query=""):
                     {scan_history_html}
                 </aside>
                 <section class="dashboard-content">
+                    {notice_html}
                     {filter_tabs_html}
                     {search_html}
                     {risk_html}
@@ -3677,8 +3947,18 @@ def dashboard(request: Request):
     scan_result = request.query_params.get("scan_result", "")
     item_filter = request.query_params.get("filter", "all")
     search_query = request.query_params.get("q", "")
+    github_status = request.query_params.get("github_status", "")
+    github_identifier = request.query_params.get("github_identifier", "")
+    github_url = request.query_params.get("github_url", "")
     return Response(
-        content=render_dashboard_html(scan_result, item_filter, search_query),
+        content=render_dashboard_html(
+            scan_result,
+            item_filter,
+            search_query,
+            github_status=github_status,
+            github_identifier=github_identifier,
+            github_url=github_url,
+        ),
         media_type="text/html",
     )
 
@@ -3708,9 +3988,9 @@ async def scan_channel_from_dashboard(request: Request):
 
 
 @app.post("/dashboard/items/{item_id}/ignore")
-def ignore_dashboard_item(item_id: int):
+def ignore_dashboard_item(item_id: int, request: Request):
     ignore_related_detected_items(item_id)
-    return Response(status_code=303, headers={"Location": "/dashboard"})
+    return Response(status_code=303, headers={"Location": dashboard_redirect_location(request)})
 
 
 @app.post("/dashboard/items/{item_id}/mark-tracked")
@@ -3718,13 +3998,35 @@ async def mark_dashboard_item_tracked(item_id: int, request: Request):
     form = await request.form()
     linear_reference = clean_text(form.get("linear_reference", ""))
     mark_related_detected_items_tracked(item_id, linear_reference=linear_reference)
-    return Response(status_code=303, headers={"Location": "/dashboard"})
+    return Response(status_code=303, headers={"Location": dashboard_redirect_location(request)})
+
+
+
+
+@app.post("/dashboard/items/{item_id}/check-github")
+def check_dashboard_item_github(item_id: int, request: Request):
+    result = check_github_for_detected_item(item_id)
+    with get_database_connection() as connection:
+        item = connection.execute(
+            "SELECT linear_identifier FROM detected_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+    linear_identifier = clean_text(item["linear_identifier"] if item else "")
+    location = dashboard_redirect_location(
+        request,
+        {
+            "github_status": result.get("status", ""),
+            "github_identifier": linear_identifier,
+            "github_url": result.get("url", ""),
+        },
+    )
+    return Response(status_code=303, headers={"Location": location})
 
 
 @app.post("/dashboard/items/{item_id}/snooze/{hours}")
-def snooze_dashboard_item(item_id: int, hours: int):
+def snooze_dashboard_item(item_id: int, hours: int, request: Request):
     snooze_related_detected_items(item_id, hours)
-    return Response(status_code=303, headers={"Location": "/dashboard"})
+    return Response(status_code=303, headers={"Location": dashboard_redirect_location(request)})
 
 
 @app.post("/slack/interactive")

@@ -1552,3 +1552,292 @@ def test_dashboard_separates_review_queue_from_history(temp_database):
     assert "Recent thread history" in html
     assert "risk-section" in html
     assert "history-section" in html
+
+
+def test_github_columns_are_created(temp_database):
+    with main.get_database_connection() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(detected_items)").fetchall()
+        }
+
+    assert "github_status" in columns
+    assert "github_url" in columns
+    assert "github_checked_at" in columns
+
+
+def test_github_pull_request_search_query_uses_repo_and_identifier(monkeypatch):
+    monkeypatch.setattr(main, "GITHUB_OWNER", "flow0178")
+    monkeypatch.setattr(main, "GITHUB_REPO", "slack-linear-bot")
+
+    query = main.github_pull_request_search_query("flo-123")
+
+    assert query == "repo:flow0178/slack-linear-bot is:pr FLO-123 in:title,body"
+
+
+def test_search_github_pull_request_for_linear_identifier_returns_first_pr(monkeypatch):
+    monkeypatch.setattr(main, "GITHUB_OWNER", "flow0178")
+    monkeypatch.setattr(main, "GITHUB_REPO", "slack-linear-bot")
+    calls = []
+
+    def fake_github_api_get(endpoint, params=None):
+        calls.append((endpoint, params))
+        return {
+            "items": [
+                {
+                    "title": "FLO-123 Fix checkout persistence",
+                    "html_url": "https://github.com/flow0178/slack-linear-bot/pull/7",
+                    "state": "open",
+                    "number": 7,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(main, "github_api_get", fake_github_api_get)
+
+    result = main.search_github_pull_request_for_linear_identifier("FLO-123")
+
+    assert result["url"] == "https://github.com/flow0178/slack-linear-bot/pull/7"
+    assert calls[0][0] == "search/issues"
+    assert calls[0][1]["q"] == "repo:flow0178/slack-linear-bot is:pr FLO-123 in:title,body"
+    assert calls[0][1]["per_page"] == 1
+
+
+def test_check_github_for_detected_item_found_updates_database(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:github-found"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-123")
+
+    monkeypatch.setattr(
+        main,
+        "search_github_pull_request_for_linear_identifier",
+        lambda linear_identifier: {
+            "title": "FLO-123 Fix checkout persistence",
+            "url": "https://github.com/flow0178/slack-linear-bot/pull/7",
+            "state": "open",
+            "number": 7,
+        },
+    )
+
+    result = main.check_github_for_detected_item(proposed_issue["id"])
+
+    assert result["status"] == "found"
+
+    updated = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    assert updated["github_status"] == "found"
+    assert updated["github_url"] == "https://github.com/flow0178/slack-linear-bot/pull/7"
+    assert updated["github_checked_at"]
+
+
+def test_check_github_for_detected_item_not_found_updates_database(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:github-not-found"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-124")
+
+    monkeypatch.setattr(
+        main,
+        "search_github_pull_request_for_linear_identifier",
+        lambda linear_identifier: None,
+    )
+
+    result = main.check_github_for_detected_item(proposed_issue["id"])
+
+    assert result["status"] == "not_found"
+
+    updated = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    assert updated["github_status"] == "not_found"
+    assert updated["github_url"] == ""
+    assert updated["github_checked_at"]
+
+
+def test_check_github_for_detected_item_without_linear_identifier_records_error(temp_database):
+    source_key = "slack-thread:C123:github-missing-linear"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+
+    result = main.check_github_for_detected_item(proposed_issue["id"])
+
+    assert result["status"] == "error"
+
+    updated = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    assert updated["github_status"] == "error"
+    assert updated["github_checked_at"]
+
+
+def test_dashboard_renders_check_github_button_for_tracked_linear_item(temp_database):
+    source_key = "slack-thread:C123:github-button"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-123")
+
+    html = main.render_dashboard_html(item_filter="tracked")
+
+    assert f'/dashboard/items/{proposed_issue["id"]}/check-github' in html
+    assert "Check GitHub" in html
+
+
+def test_github_result_survives_reanalysis(temp_database):
+    source_key = "slack-thread:C123:github-preserve"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-123")
+    main.update_detected_item_github_result(
+        proposed_issue["id"],
+        "found",
+        "https://github.com/flow0178/slack-linear-bot/pull/7",
+    )
+
+    reanalysis = saved_analysis(source_key)
+    reanalysis["proposed_issues"][0]["title"] = "fix checkout shipping method persistence issue"
+    reanalysis["action_items"][0]["task"] = "fix checkout shipping method persistence issue"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", reanalysis)
+
+    rows = get_items_for_source(source_key)
+    fix_proposed = [
+        row for row in rows
+        if row["item_type"] == "proposed_issue" and "fix checkout" in row["title"].lower()
+    ][0]
+
+    assert fix_proposed["github_status"] == "found"
+    assert fix_proposed["github_url"] == "https://github.com/flow0178/slack-linear-bot/pull/7"
+
+
+def test_dashboard_hides_action_items_but_keeps_proposed_issues(temp_database):
+    source_key = "slack-thread:C123:hide-actions"
+    analysis = saved_analysis(source_key)
+    analysis["action_items"].append(
+        {
+            "task": "backend only action item that should not render",
+            "assignee_name": "Evan",
+            "due_date": "",
+            "priority": "none",
+            "evidence": "Evan: I will handle backend only action item.",
+        }
+    )
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    html = main.render_dashboard_html()
+
+    assert "Action items" not in html
+    assert "backend only action item that should not render" not in html
+    assert "Proposed Linear issues" in html
+    assert "fix checkout page shipping method persistence" in html
+    assert " actions</span>" not in html
+
+
+def test_github_not_found_overwrites_stale_found_result(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:github-stale-not-found"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-125")
+    main.update_detected_item_github_result(
+        proposed_issue["id"],
+        "found",
+        "https://github.com/flow0178/slack-linear-bot/pull/7",
+    )
+
+    monkeypatch.setattr(
+        main,
+        "search_github_pull_request_for_linear_identifier",
+        lambda linear_identifier: None,
+    )
+
+    result = main.check_github_for_detected_item(proposed_issue["id"])
+
+    assert result["status"] == "not_found"
+    updated = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    assert updated["github_status"] == "not_found"
+    assert updated["github_url"] == ""
+    assert updated["github_checked_at"]
+
+
+def test_github_error_overwrites_stale_found_result(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:github-stale-error"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-126")
+    main.update_detected_item_github_result(
+        proposed_issue["id"],
+        "found",
+        "https://github.com/flow0178/slack-linear-bot/pull/7",
+    )
+
+    def fake_search(linear_identifier):
+        raise RuntimeError("fake repo failure")
+
+    monkeypatch.setattr(main, "search_github_pull_request_for_linear_identifier", fake_search)
+
+    result = main.check_github_for_detected_item(proposed_issue["id"])
+
+    assert result["status"] == "error"
+    updated = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    assert updated["github_status"] == "error"
+    assert updated["github_url"] == ""
+    assert updated["github_checked_at"]
+
+
+def test_github_result_is_mirrored_to_paired_action_item(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:github-paired"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-127")
+
+    monkeypatch.setattr(
+        main,
+        "search_github_pull_request_for_linear_identifier",
+        lambda linear_identifier: {
+            "title": "FLO-127 Fix checkout persistence",
+            "url": "https://github.com/flow0178/slack-linear-bot/pull/8",
+            "state": "open",
+            "number": 8,
+        },
+    )
+
+    main.check_github_for_detected_item(proposed_issue["id"])
+
+    rows = get_items_for_source(source_key)
+    paired_rows = [
+        row for row in rows
+        if row["item_type"] in {"action_item", "proposed_issue"}
+        and "fix checkout" in row["title"].lower()
+    ]
+    assert {row["item_type"] for row in paired_rows} == {"action_item", "proposed_issue"}
+    assert all(row["github_status"] == "found" for row in paired_rows)
+    assert all(row["github_url"] == "https://github.com/flow0178/slack-linear-bot/pull/8" for row in paired_rows)
+
+
+def test_dashboard_github_notice_renders_not_found_and_found():
+    not_found_html = main.render_dashboard_html(
+        github_status="not_found",
+        github_identifier="FLO-998",
+    )
+    found_html = main.render_dashboard_html(
+        github_status="found",
+        github_identifier="FLO-999",
+        github_url="https://github.com/flow0178/slack-linear-bot/pull/9",
+    )
+
+    assert "No GitHub pull request found for FLO-998." in not_found_html
+    assert "GitHub pull request found for FLO-999." in found_html
+    assert "Open pull request" in found_html
+
+
+def test_dashboard_redirect_location_preserves_tracked_filter():
+    class FakeURL:
+        scheme = "http"
+        netloc = "testserver"
+
+    class FakeRequest:
+        url = FakeURL()
+        headers = {"referer": "http://testserver/dashboard?filter=tracked&q=FLO-999"}
+
+    location = main.dashboard_redirect_location(
+        FakeRequest(),
+        {"github_status": "not_found", "github_identifier": "FLO-999"},
+    )
+
+    assert location.startswith("/dashboard?filter=tracked&q=FLO-999")
+    assert "github_status=not_found" in location
+    assert "github_identifier=FLO-999" in location
