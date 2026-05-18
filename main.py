@@ -153,6 +153,19 @@ def init_database():
         )
 
         connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                channel_id TEXT UNIQUE NOT NULL,
+                default_lookback_hours INTEGER NOT NULL DEFAULT 24,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_analyses_updated_at ON thread_analyses(updated_at DESC)"
         )
         connection.execute(
@@ -163,6 +176,12 @@ def init_database():
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_scan_history_created_at ON channel_scan_history(created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_presets_channel_id ON scan_presets(channel_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_presets_updated_at ON scan_presets(updated_at DESC)"
         )
         connection.commit()
 
@@ -1628,6 +1647,119 @@ def get_recent_channel_scan_history(limit=5):
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def normalize_lookback_hours(value, default=24):
+    if value in {None, ""}:
+        value = default
+
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        hours = default
+
+    return max(1, min(168, hours))
+
+
+def create_scan_preset(label, channel_id, default_lookback_hours=24):
+    init_database()
+    label = clean_text(label)
+    channel_id = dashboard_channel_filter(channel_id)
+    default_lookback_hours = normalize_lookback_hours(default_lookback_hours)
+
+    if not channel_id:
+        raise ValueError("channel_id is required")
+
+    if not label:
+        label = channel_id
+
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        existing = connection.execute(
+            "SELECT id, created_at FROM scan_presets WHERE channel_id = ?",
+            (channel_id,),
+        ).fetchone()
+
+        if existing:
+            preset_id = existing["id"]
+            connection.execute(
+                """
+                UPDATE scan_presets
+                SET label = ?, default_lookback_hours = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (label, default_lookback_hours, now, preset_id),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                INSERT INTO scan_presets (
+                    label, channel_id, default_lookback_hours, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (label, channel_id, default_lookback_hours, now, now),
+            )
+            preset_id = cursor.lastrowid
+
+        connection.commit()
+
+    return get_scan_preset(preset_id)
+
+
+def get_scan_preset(preset_id):
+    init_database()
+
+    with get_database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, label, channel_id, default_lookback_hours, created_at, updated_at
+            FROM scan_presets
+            WHERE id = ?
+            """,
+            (preset_id,),
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def get_scan_presets():
+    init_database()
+
+    with get_database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, label, channel_id, default_lookback_hours, created_at, updated_at
+            FROM scan_presets
+            ORDER BY label COLLATE NOCASE ASC, channel_id ASC
+            """
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def delete_scan_preset(preset_id):
+    init_database()
+
+    with get_database_connection() as connection:
+        connection.execute("DELETE FROM scan_presets WHERE id = ?", (preset_id,))
+        connection.commit()
+
+
+def scan_saved_preset(preset_id, force_rescan=False):
+    preset = get_scan_preset(preset_id)
+
+    if not preset:
+        raise ValueError("Scan preset not found")
+
+    result = scan_slack_channel_for_threads(
+        preset["channel_id"],
+        lookback_hours=preset["default_lookback_hours"],
+        force_rescan=force_rescan,
+    )
+
+    return preset, result
 
 
 def normalize_dashboard_filter(value):
@@ -3565,6 +3697,16 @@ def render_bulk_github_notice(bulk_message=""):
 
     return f'<div class="dashboard-notice {css_class}">{html_escape(bulk_message)}</div>'
 
+
+def render_preset_notice(preset_message=""):
+    preset_message = clean_text(preset_message)
+
+    if not preset_message:
+        return ""
+
+    css_class = "notice-error" if "failed" in normalize_name(preset_message) else "notice-muted"
+    return f'<div class="dashboard-notice {css_class}">{html_escape(preset_message)}</div>'
+
 def dashboard_search_url(item_filter, search_query="", channel_id=""):
     params = {"filter": normalize_dashboard_filter(item_filter)}
     search_query = clean_text(search_query)
@@ -3662,6 +3804,58 @@ def render_scan_channel_form(scan_result="", channel_id=""):
         </section>
     """
 
+
+def render_scan_presets_section(active_channel_id=""):
+    active_channel_id = dashboard_channel_filter(active_channel_id)
+    presets = get_scan_presets()
+    rows = []
+
+    for preset in presets:
+        preset_id = preset.get("id")
+        channel_id = preset.get("channel_id", "")
+        active_class = " active-preset" if channel_id == active_channel_id else ""
+        open_url = f"/dashboard?channel_id={quote(channel_id)}"
+        rows.append(f'''
+            <li class="scan-preset-row{active_class}">
+                <div class="scan-preset-copy">
+                    <strong>{html_escape(preset.get('label', ''))}</strong>
+                    <span>{html_escape(channel_id)} · {html_escape(preset.get('default_lookback_hours', 24))}h lookback</span>
+                </div>
+                <div class="scan-preset-actions">
+                    <a class="preset-link" href="{html_escape(open_url)}">Open</a>
+                    <form class="inline-form" method="post" action="/dashboard/scan-presets/{preset_id}/scan">
+                        <button type="submit" class="preset-button">Scan</button>
+                    </form>
+                    <form class="inline-form" method="post" action="/dashboard/scan-presets/{preset_id}/scan">
+                        <input type="hidden" name="force_rescan" value="1">
+                        <button type="submit" class="preset-button">Force</button>
+                    </form>
+                    <form class="inline-form" method="post" action="/dashboard/scan-presets/{preset_id}/delete">
+                        <button type="submit" class="preset-delete-button">Delete</button>
+                    </form>
+                </div>
+            </li>
+        ''')
+
+    preset_list = (
+        '<ol class="scan-preset-list">' + ''.join(rows) + '</ol>'
+        if rows else '<p class="meta">No saved scan presets yet.</p>'
+    )
+
+    return f'''
+        <section class="scan-presets-section sidebar-panel">
+            <h2>Saved scan presets</h2>
+            <p class="meta">Save channel IDs and scan them without retyping.</p>
+            {preset_list}
+            <form class="scan-preset-form" method="post" action="/dashboard/scan-presets">
+                <label>Label<input name="label" type="text" placeholder="Private Linear Test"></label>
+                <label>Channel ID<input name="channel_id" type="text" placeholder="C1234567890 or G1234567890" value="{html_escape(active_channel_id)}" required></label>
+                <label>Lookback hours<input name="default_lookback_hours" type="number" min="1" max="168" value="24" required></label>
+                <button type="submit">Save preset</button>
+            </form>
+        </section>
+    '''
+
 def entry_item_text(item):
     return " ".join(clean_text(value) for value in item.values() if value)
 
@@ -3749,7 +3943,7 @@ def render_dashboard_channel_notice(channel_id=""):
     )
 
 
-def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url="", github_bulk_result="", channel_id=""):
+def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url="", github_bulk_result="", channel_id="", preset_result=""):
     item_filter = normalize_dashboard_filter(item_filter)
     search_query = clean_text(search_query)
     channel_id = dashboard_channel_filter(channel_id)
@@ -3759,7 +3953,8 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
     search_html = render_dashboard_search_form(search_query, item_filter, channel_id)
     bulk_github_html = render_bulk_github_check_form(search_query, item_filter, channel_id)
     scan_history_html = render_channel_scan_history()
-    notice_html = render_dashboard_channel_notice(channel_id) + render_dashboard_notice(github_status, github_identifier, github_url) + render_bulk_github_notice(github_bulk_result)
+    scan_presets_html = render_scan_presets_section(channel_id)
+    notice_html = render_dashboard_channel_notice(channel_id) + render_dashboard_notice(github_status, github_identifier, github_url) + render_bulk_github_notice(github_bulk_result) + render_preset_notice(preset_result)
     entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter, channel_id=channel_id)
     entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
     cards = [render_thread_card(entry, open_by_default=False) for entry in entries]
@@ -3803,10 +3998,10 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             .dashboard-sidebar {{ position: sticky; top: 18px; display: flex; flex-direction: column; gap: 16px; }}
             .dashboard-content {{ min-width: 0; }}
             .sidebar-panel, .card, .risk-section, .history-section {{ background: white; border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }}
-            .scan-section, .scan-history-section {{ padding: 18px; }}
-            .scan-form {{ display: grid; gap: 12px; margin-top: 14px; }}
-            .scan-form label, .dashboard-search label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
-            .scan-form input, .dashboard-search input, .linear-reference-input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; font-size: 14px; width: 100%; }}
+            .scan-section, .scan-history-section, .scan-presets-section {{ padding: 18px; }}
+            .scan-form, .scan-preset-form {{ display: grid; gap: 12px; margin-top: 14px; }}
+            .scan-form label, .scan-preset-form label, .dashboard-search label {{ display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: #4b5563; }}
+            .scan-form input, .scan-preset-form input, .dashboard-search input, .linear-reference-input {{ border: 1px solid #d1d5db; border-radius: 10px; padding: 8px 10px; font-size: 14px; width: 100%; }}
             .scan-form input[type=checkbox] {{ width: auto; }}
             .checkbox-label {{ flex-direction: row !important; align-items: center; }}
             button {{ border: 1px solid var(--blue); background: var(--blue); color: white; border-radius: 999px; padding: 8px 12px; font-size: 14px; cursor: pointer; }}
@@ -3824,8 +4019,17 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             .bulk-github-button {{ border-color: #16a34a; background: #16a34a; }}
             .bulk-github-button:hover {{ background: #15803d; }}
             .clear-search {{ align-self: center; color: var(--muted); font-size: 14px; }}
-            .scan-history-list {{ list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; color: #4b5563; font-size: 13px; }}
+            .scan-history-list, .scan-preset-list {{ list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; color: #4b5563; font-size: 13px; }}
             .scan-history-list li {{ display: grid; gap: 2px; margin: 0; padding-bottom: 10px; border-bottom: 1px solid #f3f4f6; }}
+            .scan-preset-row {{ display: grid; gap: 8px; margin: 0; padding: 10px; border: 1px solid #f3f4f6; border-radius: 12px; background: #fcfcfd; }}
+            .active-preset {{ border-color: #bfdbfe; background: #eff6ff; }}
+            .scan-preset-copy {{ display: grid; gap: 2px; }}
+            .scan-preset-copy span {{ color: var(--muted); }}
+            .scan-preset-actions {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+            .preset-button, .preset-delete-button {{ border: 1px solid #d1d5db; background: white; color: #4b5563; border-radius: 999px; padding: 4px 8px; font-size: 12px; }}
+            .preset-button:hover, .preset-delete-button:hover {{ background: #f3f4f6; color: #111827; }}
+            .preset-delete-button {{ border-color: #fecaca; color: #b91c1c; }}
+            .preset-link {{ font-size: 12px; }}
             .section-header {{ display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; margin-bottom: 14px; }}
             .history-section, .risk-section {{ padding: 18px; margin-bottom: 20px; }}
             .card {{ margin-bottom: 14px; overflow: hidden; }}
@@ -3892,6 +4096,7 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             <div class="dashboard-layout">
                 <aside class="dashboard-sidebar">
                     {render_scan_channel_form(scan_result, channel_id)}
+                    {scan_presets_html}
                     {scan_history_html}
                 </aside>
                 <section class="dashboard-content">
@@ -4163,6 +4368,7 @@ def dashboard(request: Request):
     github_identifier = request.query_params.get("github_identifier", "")
     github_url = request.query_params.get("github_url", "")
     github_bulk_result = request.query_params.get("github_bulk_result", "")
+    preset_result = request.query_params.get("preset_result", "")
     return Response(
         content=render_dashboard_html(
             scan_result,
@@ -4173,6 +4379,7 @@ def dashboard(request: Request):
             github_url=github_url,
             github_bulk_result=github_bulk_result,
             channel_id=channel_id,
+            preset_result=preset_result,
         ),
         media_type="text/html",
     )
@@ -4203,6 +4410,60 @@ async def scan_channel_from_dashboard(request: Request):
     return Response(
         status_code=303,
         headers={"Location": f"/dashboard?{urlencode(query_params)}"},
+    )
+
+
+@app.post("/dashboard/scan-presets")
+async def create_scan_preset_from_dashboard(request: Request):
+    form = await request.form()
+    label = clean_text(form.get("label", ""))
+    channel_id = dashboard_channel_filter(form.get("channel_id", ""))
+    lookback_hours = clean_text(form.get("default_lookback_hours", "24")) or "24"
+
+    query_params = {}
+
+    try:
+        preset = create_scan_preset(label, channel_id, lookback_hours)
+        query_params["channel_id"] = preset["channel_id"]
+        query_params["preset_result"] = f"Saved scan preset for {preset['label']}."
+    except Exception as error:
+        logger.exception("Dashboard scan preset save failed")
+        query_params["preset_result"] = f"Saving scan preset failed: {error}"
+        if channel_id:
+            query_params["channel_id"] = channel_id
+
+    return Response(
+        status_code=303,
+        headers={"Location": f"/dashboard?{urlencode(query_params)}"},
+    )
+
+
+@app.post("/dashboard/scan-presets/{preset_id}/scan")
+async def scan_preset_from_dashboard(preset_id: int, request: Request):
+    form = await request.form()
+    force_rescan = clean_text(form.get("force_rescan", "")) == "1"
+    query_params = {}
+
+    try:
+        preset, result = scan_saved_preset(preset_id, force_rescan=force_rescan)
+        query_params["channel_id"] = preset["channel_id"]
+        query_params["scan_result"] = format_channel_scan_result(result)
+    except Exception as error:
+        logger.exception("Dashboard scan preset failed")
+        query_params["preset_result"] = f"Scan preset failed: {error}"
+
+    return Response(
+        status_code=303,
+        headers={"Location": f"/dashboard?{urlencode(query_params)}"},
+    )
+
+
+@app.post("/dashboard/scan-presets/{preset_id}/delete")
+def delete_scan_preset_from_dashboard(preset_id: int, request: Request):
+    delete_scan_preset(preset_id)
+    return Response(
+        status_code=303,
+        headers={"Location": dashboard_redirect_location(request, {"preset_result": "Deleted scan preset."})},
     )
 
 

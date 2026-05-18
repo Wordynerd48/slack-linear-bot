@@ -2213,3 +2213,85 @@ def test_github_bulk_candidates_filter_by_channel_id(temp_database):
     candidates = main.github_check_candidate_items(channel_id="GNEW456")
 
     assert [candidate["linear_identifier"] for candidate in candidates] == ["FLO-222"]
+
+
+def test_create_scan_preset_saves_and_updates_duplicate_channel(temp_database):
+    preset = main.create_scan_preset("Private Linear Test", "GNEW456", 36)
+
+    assert preset["label"] == "Private Linear Test"
+    assert preset["channel_id"] == "GNEW456"
+    assert preset["default_lookback_hours"] == 36
+
+    updated = main.create_scan_preset("Renamed Private Test", "GNEW456", 48)
+    presets = main.get_scan_presets()
+
+    assert updated["id"] == preset["id"]
+    assert len(presets) == 1
+    assert presets[0]["label"] == "Renamed Private Test"
+    assert presets[0]["default_lookback_hours"] == 48
+
+
+def test_delete_scan_preset_removes_it(temp_database):
+    preset = main.create_scan_preset("Private Linear Test", "GNEW456", 24)
+
+    main.delete_scan_preset(preset["id"])
+
+    assert main.get_scan_presets() == []
+
+
+def test_scan_saved_preset_uses_saved_channel_lookback_and_force(temp_database, monkeypatch):
+    preset = main.create_scan_preset("Private Linear Test", "GNEW456", 12)
+    calls = []
+
+    def fake_scan(channel_id, lookback_hours=24, force_rescan=False):
+        calls.append({
+            "channel_id": channel_id,
+            "lookback_hours": lookback_hours,
+            "force_rescan": force_rescan,
+        })
+        return {
+            "threads_found": 0,
+            "analyzed": 0,
+            "skipped_existing": 0,
+            "failed": 0,
+        }
+
+    monkeypatch.setattr(main, "scan_slack_channel_for_threads", fake_scan)
+
+    returned_preset, result = main.scan_saved_preset(preset["id"], force_rescan=True)
+
+    assert returned_preset["channel_id"] == "GNEW456"
+    assert result["threads_found"] == 0
+    assert calls == [{
+        "channel_id": "GNEW456",
+        "lookback_hours": 12,
+        "force_rescan": True,
+    }]
+
+
+def test_dashboard_renders_saved_scan_presets(temp_database):
+    main.create_scan_preset("Private Linear Test", "GNEW456", 24)
+
+    html = main.render_dashboard_html(channel_id="GNEW456")
+
+    assert "Saved scan presets" in html
+    assert "Private Linear Test" in html
+    assert "GNEW456" in html
+    assert 'action="/dashboard/scan-presets"' in html
+    assert 'action="/dashboard/scan-presets/1/scan"' in html
+    assert 'action="/dashboard/scan-presets/1/delete"' in html
+    assert "active-preset" in html
+
+
+def test_render_scan_presets_section_shows_empty_state(temp_database):
+    html = main.render_scan_presets_section()
+
+    assert "No saved scan presets yet." in html
+    assert "Save preset" in html
+
+
+def test_normalize_lookback_hours_clamps_presets():
+    assert main.normalize_lookback_hours("not-a-number") == 24
+    assert main.normalize_lookback_hours(0) == 1
+    assert main.normalize_lookback_hours(500) == 168
+
