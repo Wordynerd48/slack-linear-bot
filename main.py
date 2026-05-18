@@ -1099,6 +1099,36 @@ def github_missing_or_unhealthy(status):
     return clean_text(status) in {"", "not_found", "error"}
 
 
+def risk_severity_for_reasons(reasons):
+    normalized_reasons = {normalize_name(reason) for reason in reasons}
+
+    high_markers = {
+        "blocker still needs review",
+        "due within 2 days and not yet tracked",
+        "due soon but no github pr found",
+        "high priority item has not been created or matched",
+        "high priority tracked item has no github pr",
+        "github lookup failed",
+    }
+    medium_markers = {
+        "untracked action item older than 24 hours",
+        "unresolved question older than 48 hours",
+        "tracked linear item has no matching github pr",
+    }
+
+    if normalized_reasons & high_markers:
+        return "high"
+
+    if normalized_reasons & medium_markers:
+        return "medium"
+
+    return "low"
+
+
+def risk_severity_rank(severity):
+    return {"high": 0, "medium": 1, "low": 2}.get(clean_text(severity), 3)
+
+
 def get_dashboard_risks(limit=50, channel_id=""):
     init_database()
     channel_id = dashboard_channel_filter(channel_id)
@@ -1186,6 +1216,8 @@ def get_dashboard_risks(limit=50, channel_id=""):
         item = detected_item_to_dashboard_dict(row)
         primary_field = risk_item_primary_field(item_type)
 
+        severity = risk_severity_for_reasons(reasons)
+
         risks.append(
             {
                 "id": row["id"],
@@ -1193,13 +1225,17 @@ def get_dashboard_risks(limit=50, channel_id=""):
                 "title": item.get(primary_field, row["title"]),
                 "primary_field": primary_field,
                 "reasons": reasons,
+                "severity": severity,
+                "severity_rank": risk_severity_rank(severity),
                 "source_url": row["source_url"] or "",
                 "analysis_summary": row["analysis_summary"] or "",
                 "created_at": row["created_at"] or "",
+                "updated_at": row["updated_at"] or "",
                 "item": item,
             }
         )
 
+    risks.sort(key=lambda risk: (risk.get("severity_rank", 3), risk.get("updated_at", "")), reverse=False)
     return risks
 
 
@@ -1493,7 +1529,15 @@ def format_bulk_github_result(result):
         f"{int(result.get('error', 0) or 0)} error."
     )
 
-def fetch_slack_channel_messages(channel_id, lookback_hours=24, limit=100):
+def fetch_slack_channel_messages(channel_id, lookback_hours=24, limit=100, max_pages=20):
+    """Fetch recent channel messages and filter the lookback window locally.
+
+    Slack history sometimes returns fewer results than expected when `oldest` is
+    supplied, especially in private channels during manual testing. Fetch recent
+    pages without `oldest`, then stop once a page reaches messages older than
+    the lookback window. This is a little more defensive and makes scan-all
+    counts match what the Slack UI shows.
+    """
     channel_id = clean_text(channel_id)
 
     try:
@@ -1502,29 +1546,74 @@ def fetch_slack_channel_messages(channel_id, lookback_hours=24, limit=100):
         lookback_hours = 24
 
     lookback_hours = max(1, lookback_hours)
-    oldest = str(time.time() - lookback_hours * 60 * 60)
+    oldest_ts = time.time() - lookback_hours * 60 * 60
 
     if not channel_id:
         raise ValueError("channel_id is required")
 
-    data = slack_api_get(
-        "conversations.history",
-        {
-            "channel": channel_id,
-            "oldest": oldest,
-            "limit": limit,
-        },
-    )
+    messages = []
+    seen_message_ts = set()
+    cursor = ""
+    pages_fetched = 0
 
-    messages = data.get("messages", []) or []
+    while pages_fetched < max(1, int(max_pages or 1)):
+        params = {
+            "channel": channel_id,
+            "limit": limit,
+        }
+
+        if cursor:
+            params["cursor"] = cursor
+
+        data = slack_api_get("conversations.history", params)
+        pages_fetched += 1
+        page_messages = data.get("messages", []) or []
+        saw_older_than_lookback = False
+
+        for message in page_messages:
+            message_ts = clean_text(message.get("ts", ""))
+
+            if not message_ts:
+                continue
+
+            try:
+                message_time = float(message_ts)
+            except (TypeError, ValueError):
+                continue
+
+            if message_time < oldest_ts:
+                saw_older_than_lookback = True
+                continue
+
+            if message_ts in seen_message_ts:
+                continue
+
+            seen_message_ts.add(message_ts)
+            messages.append(message)
+
+        cursor = clean_text(
+            (data.get("response_metadata") or {}).get("next_cursor", "")
+        )
+
+        if not cursor or saw_older_than_lookback:
+            break
+
+    if cursor and pages_fetched >= max(1, int(max_pages or 1)):
+        logger.warning(
+            "Slack channel history pagination stopped at max_pages=%s for channel=%s",
+            max_pages,
+            channel_id,
+        )
+
     logger.info(
-        "Fetched %s Slack channel messages from channel=%s lookback_hours=%s",
+        "Fetched %s Slack channel messages from channel=%s lookback_hours=%s pages=%s local_oldest=%s",
         len(messages),
         channel_id,
         lookback_hours,
+        pages_fetched,
+        oldest_ts,
     )
     return messages
-
 
 def source_key_exists(source_key):
     source_key = clean_text(source_key)
@@ -1762,6 +1851,59 @@ def scan_saved_preset(preset_id, force_rescan=False):
     return preset, result
 
 
+def scan_all_saved_presets(force_rescan=False):
+    """Scan every saved preset and return a combined summary.
+
+    This keeps auto-scan groundwork explicit: only channels saved as presets are
+    scanned, each preset uses its own default lookback, and failures are counted
+    without stopping the rest of the batch.
+    """
+    presets = get_scan_presets()
+    result = {
+        "presets_total": len(presets),
+        "presets_scanned": 0,
+        "presets_failed": 0,
+        "threads_found": 0,
+        "analyzed": 0,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+
+    for preset in presets:
+        try:
+            scan_result = scan_slack_channel_for_threads(
+                preset["channel_id"],
+                lookback_hours=preset["default_lookback_hours"],
+                force_rescan=force_rescan,
+            )
+            result["presets_scanned"] += 1
+            result["threads_found"] += int(scan_result.get("threads_found", 0) or 0)
+            result["analyzed"] += int(scan_result.get("analyzed", 0) or 0)
+            result["skipped_existing"] += int(scan_result.get("skipped_existing", 0) or 0)
+            result["failed"] += int(scan_result.get("failed", 0) or 0)
+        except Exception:
+            logger.exception("Saved scan preset failed: id=%s channel=%s", preset.get("id"), preset.get("channel_id"))
+            result["presets_failed"] += 1
+            result["failed"] += 1
+
+    return result
+
+
+def format_scan_all_presets_result(result):
+    presets_total = int(result.get("presets_total", 0) or 0)
+
+    if presets_total <= 0:
+        return "No saved scan presets to scan."
+
+    return (
+        f"Scanned {int(result.get('presets_scanned', 0) or 0)} of {presets_total} preset(s): "
+        f"{int(result.get('threads_found', 0) or 0)} thread(s) found, "
+        f"{int(result.get('analyzed', 0) or 0)} analyzed, "
+        f"{int(result.get('skipped_existing', 0) or 0)} skipped, "
+        f"{int(result.get('failed', 0) or 0)} failed."
+    )
+
+
 def normalize_dashboard_filter(value):
     value = normalize_name(value)
     allowed_filters = {"all", "risks", "new", "tracked", "snoozed", "ignored"}
@@ -1791,18 +1933,48 @@ def detected_item_matches_dashboard_filter(item, item_filter):
     return status != "ignored"
 
 
+def message_is_supported_thread_candidate(message):
+    if not message:
+        return False
+
+    if message.get("subtype"):
+        return False
+
+    message_ts = clean_text(message.get("ts", ""))
+    thread_ts = clean_text(message.get("thread_ts", ""))
+
+    if not message_ts:
+        return False
+
+    # Replies themselves can appear in history for some Slack surfaces. They
+    # should not be analyzed as separate parent threads. Some Slack fixtures and
+    # surfaces represent the parent as ts != thread_ts while still carrying
+    # reply_count, so keep those as valid parent candidates.
+    if thread_ts and thread_ts != message_ts and not message_has_thread_replies(message):
+        return False
+
+    return True
+
+
+def message_has_thread_replies(message):
+    try:
+        return int(message.get("reply_count") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def channel_thread_parent_messages(messages):
     parents = []
     seen_thread_ts = set()
 
     for message in messages or []:
-        if message.get("subtype"):
+        if not message_is_supported_thread_candidate(message):
             continue
 
-        if int(message.get("reply_count") or 0) <= 0:
+        if not message_has_thread_replies(message):
             continue
 
-        thread_ts = message.get("thread_ts") or message.get("ts")
+        thread_ts = clean_text(message.get("thread_ts") or message.get("ts"))
 
         if not thread_ts or thread_ts in seen_thread_ts:
             continue
@@ -1810,6 +1982,71 @@ def channel_thread_parent_messages(messages):
         seen_thread_ts.add(thread_ts)
         parents.append(message)
 
+    return parents
+
+
+def discover_thread_parent_messages(channel_id, messages, max_probe_count=100):
+    """Find thread parents from channel history.
+
+    Slack's history response normally includes reply_count on thread parents,
+    but that field is not reliable enough for manual scanning. As a fallback,
+    probe recent top-level messages with conversations.replies and treat the
+    message as a parent only when Slack returns more than the parent message.
+    """
+    parents = channel_thread_parent_messages(messages)
+    parent_by_thread_ts = {
+        clean_text(parent.get("thread_ts") or parent.get("ts")): parent
+        for parent in parents
+    }
+    probe_count = 0
+
+    for message in messages or []:
+        if not message_is_supported_thread_candidate(message):
+            continue
+
+        thread_ts = clean_text(message.get("thread_ts") or message.get("ts"))
+
+        if not thread_ts or thread_ts in parent_by_thread_ts:
+            continue
+
+        if probe_count >= max(0, int(max_probe_count or 0)):
+            break
+
+        probe_count += 1
+
+        try:
+            replies = fetch_slack_thread(channel_id, thread_ts)
+        except Exception:
+            logger.exception(
+                "Could not probe Slack thread replies: channel_id=%s thread_ts=%s",
+                channel_id,
+                thread_ts,
+            )
+            continue
+
+        if len(replies or []) <= 1:
+            continue
+
+        enriched_message = dict(message)
+        enriched_message["reply_count"] = max(
+            int(enriched_message.get("reply_count") or 0),
+            len(replies) - 1,
+        )
+        latest_reply_ts = clean_text((replies[-1] or {}).get("ts", "")) if replies else ""
+
+        if latest_reply_ts:
+            enriched_message["latest_reply"] = latest_reply_ts
+
+        parent_by_thread_ts[thread_ts] = enriched_message
+        parents.append(enriched_message)
+
+    logger.info(
+        "Discovered %s Slack thread parent(s) from %s channel message(s); probed=%s channel=%s",
+        len(parents),
+        len(messages or []),
+        probe_count,
+        channel_id,
+    )
     return parents
 
 
@@ -1846,7 +2083,7 @@ def scan_slack_channel_for_threads(channel_id, lookback_hours=24, force_rescan=F
         raise ValueError("channel_id is required")
 
     messages = fetch_slack_channel_messages(channel_id, lookback_hours=lookback_hours)
-    thread_parents = channel_thread_parent_messages(messages)
+    thread_parents = discover_thread_parent_messages(channel_id, messages)
     thread_parents = sorted(
         thread_parents,
         key=lambda message: float(message.get("thread_ts") or message.get("ts") or 0),
@@ -3604,11 +3841,16 @@ def render_dashboard_risks(risks):
         reasons = "".join(f'<li>{html_escape(reason)}</li>' for reason in risk.get("reasons", []))
         summary = html_escape(risk.get("analysis_summary", ""))
         summary_line = f'<p class="risk-summary">{summary}</p>' if summary else ""
+        severity = clean_text(risk.get("severity", "low")) or "low"
+        severity_label = severity.title()
         cards.append(f"""
-            <article class="risk-card">
+            <article class="risk-card risk-severity-{html_escape(severity)}">
                 <div class="risk-card-main">
                     <div>
-                        <h3>{html_escape(risk.get('title', 'Untitled risk'))}</h3>
+                        <div class="risk-title-line">
+                            <h3>{html_escape(risk.get('title', 'Untitled risk'))}</h3>
+                            <span class="severity-pill severity-{html_escape(severity)}">{html_escape(severity_label)}</span>
+                        </div>
                         <p class="meta">{html_escape(risk.get('created_at', ''))} · {source_link}</p>
                         {summary_line}
                         <ul class="risk-reasons">{reasons}</ul>
@@ -3846,6 +4088,10 @@ def render_scan_presets_section(active_channel_id=""):
         <section class="scan-presets-section sidebar-panel">
             <h2>Saved scan presets</h2>
             <p class="meta">Save channel IDs and scan them without retyping.</p>
+            <form class="scan-all-presets-form" method="post" action="/dashboard/scan-presets/scan-all">
+                <button type="submit" class="scan-all-button">Scan all presets</button>
+                <label class="checkbox-label"><input name="force_rescan" type="checkbox" value="1"> Force</label>
+            </form>
             {preset_list}
             <form class="scan-preset-form" method="post" action="/dashboard/scan-presets">
                 <label>Label<input name="label" type="text" placeholder="Private Linear Test"></label>
@@ -4026,6 +4272,9 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             .scan-preset-copy {{ display: grid; gap: 2px; }}
             .scan-preset-copy span {{ color: var(--muted); }}
             .scan-preset-actions {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+            .scan-all-presets-form {{ display: flex; gap: 8px; align-items: center; margin-top: 12px; }}
+            .scan-all-button {{ border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; border-radius: 999px; padding: 6px 10px; font-size: 12px; cursor: pointer; }}
+            .scan-all-button:hover {{ background: #dbeafe; }}
             .preset-button, .preset-delete-button {{ border: 1px solid #d1d5db; background: white; color: #4b5563; border-radius: 999px; padding: 4px 8px; font-size: 12px; }}
             .preset-button:hover, .preset-delete-button:hover {{ background: #f3f4f6; color: #111827; }}
             .preset-delete-button {{ border-color: #fecaca; color: #b91c1c; }}
@@ -4052,8 +4301,13 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             .risk-section {{ background: #fff7ed; border-color: #fed7aa; }}
             .risk-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }}
             .risk-card {{ background: white; border: 1px solid #fed7aa; border-radius: 14px; padding: 16px; }}
-            .risk-card h3 {{ margin-top: 0; text-transform: none; letter-spacing: 0; font-size: 16px; color: #1f2937; }}
+            .risk-card h3 {{ margin: 0; text-transform: none; letter-spacing: 0; font-size: 16px; color: #1f2937; }}
             .risk-card-main {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }}
+            .risk-title-line {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+            .severity-pill {{ white-space: nowrap; border-radius: 999px; padding: 3px 8px; font-size: 11px; font-weight: 700; }}
+            .severity-high {{ background: #fee2e2; color: #991b1b; }}
+            .severity-medium {{ background: #fef3c7; color: #92400e; }}
+            .severity-low {{ background: #e0f2fe; color: #075985; }}
             .risk-summary {{ margin: 8px 0; color: #4b5563; font-size: 14px; }}
             .risk-reasons {{ margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 14px; }}
             .compact-item-list {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }}
@@ -4432,6 +4686,25 @@ async def create_scan_preset_from_dashboard(request: Request):
         if channel_id:
             query_params["channel_id"] = channel_id
 
+    return Response(
+        status_code=303,
+        headers={"Location": f"/dashboard?{urlencode(query_params)}"},
+    )
+
+
+@app.post("/dashboard/scan-presets/scan-all")
+async def scan_all_presets_from_dashboard(request: Request):
+    form = await request.form()
+    force_rescan = clean_text(form.get("force_rescan", "")) == "1"
+
+    try:
+        result = scan_all_saved_presets(force_rescan=force_rescan)
+        message = format_scan_all_presets_result(result)
+    except Exception as error:
+        logger.exception("Dashboard scan all presets failed")
+        message = f"Scan all presets failed: {error}"
+
+    query_params = {"preset_result": message}
     return Response(
         status_code=303,
         headers={"Location": f"/dashboard?{urlencode(query_params)}"},

@@ -872,6 +872,7 @@ def test_scan_channel_clamps_invalid_lookback_hours(temp_database, monkeypatch):
 
 
 def test_fetch_slack_channel_messages_calls_slack_history(monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
     calls = []
 
     def fake_slack_api_get(endpoint, params=None):
@@ -901,7 +902,101 @@ def test_fetch_slack_channel_messages_calls_slack_history(monkeypatch):
     assert calls[0][0] == "conversations.history"
     assert calls[0][1]["channel"] == "C123"
     assert calls[0][1]["limit"] == 100
-    assert "oldest" in calls[0][1]
+    assert "oldest" not in calls[0][1]
+
+
+def test_fetch_slack_channel_messages_paginates_until_no_next_cursor(monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+    calls = []
+
+    def fake_slack_api_get(endpoint, params=None):
+        calls.append((endpoint, params or {}))
+
+        if len(calls) == 1:
+            return {
+                "messages": [
+                    {
+                        "ts": "222.000",
+                        "text": "Newest message",
+                        "reply_count": 1,
+                    }
+                ],
+                "response_metadata": {"next_cursor": "cursor-page-2"},
+            }
+
+        return {
+            "messages": [
+                {
+                    "ts": "111.000",
+                    "text": "Older thread parent",
+                    "reply_count": 3,
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    monkeypatch.setattr(main, "slack_api_get", fake_slack_api_get)
+
+    messages = main.fetch_slack_channel_messages("C123", lookback_hours=24)
+
+    assert [message["ts"] for message in messages] == ["222.000", "111.000"]
+    assert len(calls) == 2
+    assert calls[0][0] == "conversations.history"
+    assert calls[0][1]["channel"] == "C123"
+    assert "cursor" not in calls[0][1]
+    assert calls[1][1]["cursor"] == "cursor-page-2"
+
+
+def test_fetch_slack_channel_messages_deduplicates_paginated_messages(monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+
+    def fake_slack_api_get(endpoint, params=None):
+        if not (params or {}).get("cursor"):
+            return {
+                "messages": [
+                    {"ts": "222.000", "text": "Duplicate", "reply_count": 1},
+                ],
+                "response_metadata": {"next_cursor": "next"},
+            }
+
+        return {
+            "messages": [
+                {"ts": "222.000", "text": "Duplicate", "reply_count": 1},
+                {"ts": "111.000", "text": "Older", "reply_count": 2},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    monkeypatch.setattr(main, "slack_api_get", fake_slack_api_get)
+
+    messages = main.fetch_slack_channel_messages("C123", lookback_hours=24)
+
+    assert [message["ts"] for message in messages] == ["222.000", "111.000"]
+
+def test_fetch_slack_channel_messages_filters_lookback_locally(monkeypatch):
+    current_time = 1_000_000.0
+    monkeypatch.setattr(main.time, "time", lambda: current_time)
+
+    calls = []
+
+    def fake_slack_api_get(endpoint, params=None):
+        calls.append(params or {})
+        return {
+            "messages": [
+                {"ts": str(current_time - 60), "text": "Recent parent", "reply_count": 1},
+                {"ts": str(current_time - 25 * 60 * 60), "text": "Older parent", "reply_count": 1},
+            ],
+            "response_metadata": {"next_cursor": "next-page"},
+        }
+
+    monkeypatch.setattr(main, "slack_api_get", fake_slack_api_get)
+
+    messages = main.fetch_slack_channel_messages("C123", lookback_hours=24)
+
+    assert [message["text"] for message in messages] == ["Recent parent"]
+    assert len(calls) == 1
+    assert "oldest" not in calls[0]
+
 
 
 def test_dashboard_scan_form_is_rendered():
@@ -2295,3 +2390,245 @@ def test_normalize_lookback_hours_clamps_presets():
     assert main.normalize_lookback_hours(0) == 1
     assert main.normalize_lookback_hours(500) == 168
 
+
+
+
+def test_scan_all_saved_presets_scans_each_preset_and_combines_results(temp_database, monkeypatch):
+    first = main.create_scan_preset("Private Test", "GPRIVATE", 12)
+    second = main.create_scan_preset("Bot Testing", "CBOT", 24)
+    calls = []
+
+    def fake_scan(channel_id, lookback_hours=24, force_rescan=False):
+        calls.append({
+            "channel_id": channel_id,
+            "lookback_hours": lookback_hours,
+            "force_rescan": force_rescan,
+        })
+        if channel_id == "GPRIVATE":
+            return {"threads_found": 2, "analyzed": 1, "skipped_existing": 1, "failed": 0}
+        return {"threads_found": 3, "analyzed": 2, "skipped_existing": 1, "failed": 0}
+
+    monkeypatch.setattr(main, "scan_slack_channel_for_threads", fake_scan)
+
+    result = main.scan_all_saved_presets(force_rescan=True)
+
+    assert result == {
+        "presets_total": 2,
+        "presets_scanned": 2,
+        "presets_failed": 0,
+        "threads_found": 5,
+        "analyzed": 3,
+        "skipped_existing": 2,
+        "failed": 0,
+    }
+    assert calls == [
+        {"channel_id": "CBOT", "lookback_hours": 24, "force_rescan": True},
+        {"channel_id": "GPRIVATE", "lookback_hours": 12, "force_rescan": True},
+    ]
+
+
+def test_scan_all_saved_presets_counts_failed_preset_without_stopping(temp_database, monkeypatch):
+    main.create_scan_preset("Broken", "GBROKEN", 12)
+    main.create_scan_preset("Working", "GWORKING", 24)
+
+    def fake_scan(channel_id, lookback_hours=24, force_rescan=False):
+        if channel_id == "GBROKEN":
+            raise RuntimeError("fake preset failure")
+        return {"threads_found": 1, "analyzed": 1, "skipped_existing": 0, "failed": 0}
+
+    monkeypatch.setattr(main, "scan_slack_channel_for_threads", fake_scan)
+
+    result = main.scan_all_saved_presets()
+
+    assert result["presets_total"] == 2
+    assert result["presets_scanned"] == 1
+    assert result["presets_failed"] == 1
+    assert result["threads_found"] == 1
+    assert result["analyzed"] == 1
+    assert result["failed"] == 1
+
+
+def test_format_scan_all_presets_result_handles_empty_and_summary():
+    assert main.format_scan_all_presets_result({"presets_total": 0}) == "No saved scan presets to scan."
+
+    message = main.format_scan_all_presets_result({
+        "presets_total": 2,
+        "presets_scanned": 2,
+        "threads_found": 5,
+        "analyzed": 3,
+        "skipped_existing": 2,
+        "failed": 1,
+    })
+
+    assert message == "Scanned 2 of 2 preset(s): 5 thread(s) found, 3 analyzed, 2 skipped, 1 failed."
+
+
+def test_dashboard_renders_scan_all_presets_button(temp_database):
+    main.create_scan_preset("Private Linear Test", "GNEW456", 24)
+
+    html = main.render_dashboard_html()
+
+    assert 'action="/dashboard/scan-presets/scan-all"' in html
+    assert "Scan all presets" in html
+
+
+def test_risk_severity_labels_and_sorts_high_before_medium_and_low(temp_database):
+    medium_source_key = "slack-thread:C123:risk-severity-medium"
+    high_source_key = "slack-thread:C123:risk-severity-high"
+    low_source_key = "slack-thread:C123:risk-severity-low"
+
+    medium_analysis = saved_analysis(medium_source_key)
+    medium_analysis["proposed_issues"][0]["priority"] = "none"
+    medium_analysis["proposed_issues"][0]["due_date"] = ""
+    medium_analysis["proposed_issues"][0]["title"] = "medium github missing issue"
+    medium_analysis["proposed_issues"][0]["description"] = "medium github missing issue"
+
+    high_analysis = saved_analysis(high_source_key)
+    high_analysis["blockers"] = [{
+        "blocker": "high severity blocker",
+        "owner": "Alex",
+        "evidence": "Alex: blocked",
+    }]
+    high_analysis["proposed_issues"] = []
+    high_analysis["action_items"] = []
+    high_analysis["unresolved_questions"] = []
+
+    low_analysis = saved_analysis(low_source_key)
+    low_analysis["proposed_issues"][0]["priority"] = "none"
+    low_analysis["proposed_issues"][0]["due_date"] = ""
+    low_analysis["proposed_issues"][0]["title"] = "low github unchecked issue"
+    low_analysis["proposed_issues"][0]["description"] = "low github unchecked issue"
+
+    main.save_thread_analysis(medium_source_key, "https://example.slack.com/medium", medium_analysis)
+    main.save_thread_analysis(high_source_key, "https://example.slack.com/high", high_analysis)
+    main.save_thread_analysis(low_source_key, "https://example.slack.com/low", low_analysis)
+
+    medium_issue = item_by_type_and_title(medium_source_key, "proposed_issue", "medium github")
+    low_issue = item_by_type_and_title(low_source_key, "proposed_issue", "low github")
+
+    main.mark_related_detected_items_tracked(medium_issue["id"], linear_reference="FLO-700")
+    main.update_detected_item_github_result(medium_issue["id"], "not_found", "")
+    main.mark_related_detected_items_tracked(low_issue["id"], linear_reference="FLO-701")
+
+    risks = main.get_dashboard_risks(limit=10)
+    risk_by_title = {risk["title"]: risk for risk in risks}
+
+    assert risk_by_title["high severity blocker"]["severity"] == "high"
+    assert risk_by_title["medium github missing issue"]["severity"] == "medium"
+    assert risk_by_title["low github unchecked issue"]["severity"] == "low"
+
+    ordered_titles = [risk["title"] for risk in risks]
+    assert ordered_titles.index("high severity blocker") < ordered_titles.index("medium github missing issue")
+    assert ordered_titles.index("medium github missing issue") < ordered_titles.index("low github unchecked issue")
+
+
+def test_dashboard_renders_risk_severity_badges(temp_database):
+    source_key = "slack-thread:C123:risk-severity-render"
+    analysis = saved_analysis(source_key)
+    analysis["blockers"] = [{
+        "blocker": "production release blocker",
+        "owner": "Alex",
+        "evidence": "Alex: release is blocked",
+    }]
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    html = main.render_dashboard_html(item_filter="risks")
+
+    assert "severity-pill severity-high" in html
+    assert ">High</span>" in html
+
+
+def test_discover_thread_parent_messages_probes_top_level_messages_without_reply_count(monkeypatch):
+    messages = [
+        {
+            "ts": "111.000",
+            "text": "Parent with reply_count",
+            "reply_count": 1,
+        },
+        {
+            "ts": "222.000",
+            "text": "Parent missing reply_count",
+        },
+        {
+            "ts": "333.001",
+            "thread_ts": "333.000",
+            "text": "Reply that should not be probed as a parent",
+        },
+        {
+            "ts": "444.000",
+            "text": "Standalone message",
+        },
+    ]
+
+    def fake_fetch_slack_thread(channel_id, thread_ts):
+        if thread_ts == "222.000":
+            return [
+                {"ts": "222.000", "text": "Parent missing reply_count"},
+                {"ts": "222.100", "text": "Threaded reply"},
+            ]
+
+        if thread_ts == "444.000":
+            return [{"ts": "444.000", "text": "Standalone message"}]
+
+        raise AssertionError(f"Unexpected thread probe: {thread_ts}")
+
+    monkeypatch.setattr(main, "fetch_slack_thread", fake_fetch_slack_thread)
+
+    parents = main.discover_thread_parent_messages("C123", messages)
+
+    assert [parent["ts"] for parent in parents] == ["111.000", "222.000"]
+    assert parents[1]["reply_count"] == 1
+
+
+def test_scan_channel_uses_thread_discovery_fallback(temp_database, monkeypatch):
+    channel_id = "C123"
+    analyzed_threads = []
+
+    monkeypatch.setattr(
+        main,
+        "fetch_slack_channel_messages",
+        lambda channel_id_arg, lookback_hours=24: [
+            {
+                "ts": "111.000",
+                "text": "Parent with reply_count",
+                "reply_count": 1,
+            },
+            {
+                "ts": "222.000",
+                "text": "Parent missing reply_count",
+            },
+        ],
+    )
+
+    def fake_fetch_slack_thread(channel_id_arg, thread_ts):
+        if thread_ts == "222.000":
+            return [
+                {"ts": "222.000", "text": "Parent missing reply_count"},
+                {"ts": "222.100", "text": "Threaded reply"},
+            ]
+
+        return [{"ts": thread_ts, "text": "Parent only"}]
+
+    def fake_analyze_and_save_thread_from_channel_scan(channel_id_arg, thread_ts_arg, scan_metadata=None):
+        analyzed_threads.append(thread_ts_arg)
+        source_key = main.build_slack_source_key(channel_id_arg, thread_ts_arg)
+        main.save_thread_analysis(
+            source_key,
+            "https://example.slack.com/thread",
+            saved_analysis(source_key),
+            scan_metadata=scan_metadata,
+        )
+        return True
+
+    monkeypatch.setattr(main, "fetch_slack_thread", fake_fetch_slack_thread)
+    monkeypatch.setattr(main, "analyze_and_save_thread_from_channel_scan", fake_analyze_and_save_thread_from_channel_scan)
+
+    result = main.scan_slack_channel_for_threads(channel_id, lookback_hours=24, force_rescan=True)
+
+    assert result == {
+        "threads_found": 2,
+        "analyzed": 2,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+    assert analyzed_threads == ["111.000", "222.000"]
