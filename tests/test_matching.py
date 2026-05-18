@@ -2412,15 +2412,16 @@ def test_scan_all_saved_presets_scans_each_preset_and_combines_results(temp_data
 
     result = main.scan_all_saved_presets(force_rescan=True)
 
-    assert result == {
-        "presets_total": 2,
-        "presets_scanned": 2,
-        "presets_failed": 0,
-        "threads_found": 5,
-        "analyzed": 3,
-        "skipped_existing": 2,
-        "failed": 0,
-    }
+    assert result["presets_total"] == 2
+    assert result["presets_scanned"] == 2
+    assert result["presets_failed"] == 0
+    assert result["threads_found"] == 5
+    assert result["analyzed"] == 3
+    assert result["skipped_existing"] == 2
+    assert result["failed"] == 0
+    assert [detail["label"] for detail in result["details"]] == ["Bot Testing", "Private Test"]
+    assert result["details"][0]["threads_found"] == 3
+    assert result["details"][1]["threads_found"] == 2
     assert calls == [
         {"channel_id": "CBOT", "lookback_hours": 24, "force_rescan": True},
         {"channel_id": "GPRIVATE", "lookback_hours": 12, "force_rescan": True},
@@ -2462,6 +2463,23 @@ def test_format_scan_all_presets_result_handles_empty_and_summary():
 
     assert message == "Scanned 2 of 2 preset(s): 5 thread(s) found, 3 analyzed, 2 skipped, 1 failed."
 
+    message_with_breakdown = main.format_scan_all_presets_result({
+        "presets_total": 2,
+        "presets_scanned": 2,
+        "threads_found": 5,
+        "analyzed": 3,
+        "skipped_existing": 2,
+        "failed": 1,
+        "details": [
+            {"label": "Bot Testing", "threads_found": 3, "analyzed": 2, "skipped_existing": 1, "failed": 0, "status": "success"},
+            {"label": "Private Test", "threads_found": 2, "analyzed": 1, "skipped_existing": 1, "failed": 1, "status": "error"},
+        ],
+    })
+
+    assert "Breakdown:" in message_with_breakdown
+    assert "Bot Testing: 3 found, 2 analyzed, 1 skipped, 0 failed" in message_with_breakdown
+    assert "Private Test: 2 found, 1 analyzed, 1 skipped, 1 failed (error)" in message_with_breakdown
+
 
 def test_dashboard_renders_scan_all_presets_button(temp_database):
     main.create_scan_preset("Private Linear Test", "GNEW456", 24)
@@ -2470,6 +2488,71 @@ def test_dashboard_renders_scan_all_presets_button(temp_database):
 
     assert 'action="/dashboard/scan-presets/scan-all"' in html
     assert "Scan all presets" in html
+
+
+def test_scan_saved_preset_updates_last_result_metadata(temp_database, monkeypatch):
+    preset = main.create_scan_preset("Private Linear Test", "GNEW456", 12)
+
+    def fake_scan(channel_id, lookback_hours=24, force_rescan=False):
+        return {"threads_found": 4, "analyzed": 3, "skipped_existing": 1, "failed": 0}
+
+    monkeypatch.setattr(main, "scan_slack_channel_for_threads", fake_scan)
+
+    main.scan_saved_preset(preset["id"], force_rescan=True)
+    updated = main.get_scan_preset(preset["id"])
+
+    assert updated["last_scanned_at"]
+    assert updated["last_threads_found"] == 4
+    assert updated["last_analyzed"] == 3
+    assert updated["last_skipped_existing"] == 1
+    assert updated["last_failed"] == 0
+    assert updated["last_force_rescan"] == 1
+    assert updated["last_result_status"] == "success"
+    assert "Private Linear Test: 4 found, 3 analyzed, 1 skipped, 0 failed" in updated["last_result_message"]
+
+
+def test_scan_all_saved_presets_updates_each_preset_last_result(temp_database, monkeypatch):
+    first = main.create_scan_preset("Broken", "GBROKEN", 12)
+    second = main.create_scan_preset("Working", "GWORKING", 24)
+
+    def fake_scan(channel_id, lookback_hours=24, force_rescan=False):
+        if channel_id == "GBROKEN":
+            raise RuntimeError("fake preset failure")
+        return {"threads_found": 2, "analyzed": 2, "skipped_existing": 0, "failed": 0}
+
+    monkeypatch.setattr(main, "scan_slack_channel_for_threads", fake_scan)
+
+    result = main.scan_all_saved_presets(force_rescan=True)
+    broken = main.get_scan_preset(first["id"])
+    working = main.get_scan_preset(second["id"])
+
+    assert len(result["details"]) == 2
+    assert broken["last_result_status"] == "error"
+    assert broken["last_failed"] == 1
+    assert broken["last_force_rescan"] == 1
+    assert "fake preset failure" in broken["last_result_message"]
+    assert working["last_result_status"] == "success"
+    assert working["last_threads_found"] == 2
+    assert working["last_analyzed"] == 2
+    assert working["last_force_rescan"] == 1
+
+
+def test_dashboard_renders_scan_preset_last_result_metadata(temp_database, monkeypatch):
+    preset = main.create_scan_preset("Private Linear Test", "GNEW456", 24)
+
+    main.update_scan_preset_last_result(
+        preset["id"],
+        {"threads_found": 2, "analyzed": 1, "skipped_existing": 1, "failed": 0},
+        force_rescan=True,
+        status="success",
+        message="Private Linear Test: 2 found, 1 analyzed, 1 skipped, 0 failed",
+    )
+
+    html = main.render_dashboard_html(channel_id="GNEW456")
+
+    assert "Last scanned:" in html
+    assert "force" in html
+    assert "2 found, 1 analyzed, 1 skipped, 0 failed" in html
 
 
 def test_risk_severity_labels_and_sorts_high_before_medium_and_low(temp_database):

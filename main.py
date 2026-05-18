@@ -159,11 +159,41 @@ def init_database():
                 label TEXT NOT NULL,
                 channel_id TEXT UNIQUE NOT NULL,
                 default_lookback_hours INTEGER NOT NULL DEFAULT 24,
+                last_scanned_at TEXT,
+                last_threads_found INTEGER NOT NULL DEFAULT 0,
+                last_analyzed INTEGER NOT NULL DEFAULT 0,
+                last_skipped_existing INTEGER NOT NULL DEFAULT 0,
+                last_failed INTEGER NOT NULL DEFAULT 0,
+                last_force_rescan INTEGER NOT NULL DEFAULT 0,
+                last_result_status TEXT,
+                last_result_message TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+
+        existing_preset_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(scan_presets)").fetchall()
+        }
+
+        preset_columns_to_add = {
+            "last_scanned_at": "TEXT",
+            "last_threads_found": "INTEGER NOT NULL DEFAULT 0",
+            "last_analyzed": "INTEGER NOT NULL DEFAULT 0",
+            "last_skipped_existing": "INTEGER NOT NULL DEFAULT 0",
+            "last_failed": "INTEGER NOT NULL DEFAULT 0",
+            "last_force_rescan": "INTEGER NOT NULL DEFAULT 0",
+            "last_result_status": "TEXT",
+            "last_result_message": "TEXT",
+        }
+
+        for column_name, column_definition in preset_columns_to_add.items():
+            if column_name not in existing_preset_columns:
+                connection.execute(
+                    f"ALTER TABLE scan_presets ADD COLUMN {column_name} {column_definition}"
+                )
 
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_analyses_updated_at ON thread_analyses(updated_at DESC)"
@@ -1803,7 +1833,11 @@ def get_scan_preset(preset_id):
     with get_database_connection() as connection:
         row = connection.execute(
             """
-            SELECT id, label, channel_id, default_lookback_hours, created_at, updated_at
+            SELECT id, label, channel_id, default_lookback_hours,
+                   last_scanned_at, last_threads_found, last_analyzed,
+                   last_skipped_existing, last_failed, last_force_rescan,
+                   last_result_status, last_result_message,
+                   created_at, updated_at
             FROM scan_presets
             WHERE id = ?
             """,
@@ -1819,7 +1853,11 @@ def get_scan_presets():
     with get_database_connection() as connection:
         rows = connection.execute(
             """
-            SELECT id, label, channel_id, default_lookback_hours, created_at, updated_at
+            SELECT id, label, channel_id, default_lookback_hours,
+                   last_scanned_at, last_threads_found, last_analyzed,
+                   last_skipped_existing, last_failed, last_force_rescan,
+                   last_result_status, last_result_message,
+                   created_at, updated_at
             FROM scan_presets
             ORDER BY label COLLATE NOCASE ASC, channel_id ASC
             """
@@ -1836,28 +1874,118 @@ def delete_scan_preset(preset_id):
         connection.commit()
 
 
+def normalize_scan_result_counts(scan_result):
+    scan_result = scan_result or {}
+    return {
+        "threads_found": int(scan_result.get("threads_found", 0) or 0),
+        "analyzed": int(scan_result.get("analyzed", 0) or 0),
+        "skipped_existing": int(scan_result.get("skipped_existing", 0) or 0),
+        "failed": int(scan_result.get("failed", 0) or 0),
+    }
+
+
+def scan_preset_detail(preset, scan_result=None, force_rescan=False, status="success", error_message=""):
+    counts = normalize_scan_result_counts(scan_result)
+    return {
+        "id": preset.get("id"),
+        "label": preset.get("label", ""),
+        "channel_id": preset.get("channel_id", ""),
+        "lookback_hours": int(preset.get("default_lookback_hours", 24) or 24),
+        "force_rescan": bool(force_rescan),
+        "status": clean_text(status) or "success",
+        "error": clean_text(error_message),
+        **counts,
+    }
+
+
+def scan_preset_detail_summary(detail):
+    label = clean_text(detail.get("label", "")) or clean_text(detail.get("channel_id", "")) or "Preset"
+    status = clean_text(detail.get("status", "success"))
+    summary = (
+        f"{label}: {int(detail.get('threads_found', 0) or 0)} found, "
+        f"{int(detail.get('analyzed', 0) or 0)} analyzed, "
+        f"{int(detail.get('skipped_existing', 0) or 0)} skipped, "
+        f"{int(detail.get('failed', 0) or 0)} failed"
+    )
+
+    if status and status != "success":
+        summary += f" ({status})"
+
+    return summary
+
+
+def update_scan_preset_last_result(preset_id, scan_result=None, force_rescan=False, status="success", message=""):
+    init_database()
+    counts = normalize_scan_result_counts(scan_result)
+    status = clean_text(status) or "success"
+    message = clean_text(message)
+    now = current_timestamp()
+
+    with get_database_connection() as connection:
+        connection.execute(
+            """
+            UPDATE scan_presets
+            SET last_scanned_at = ?,
+                last_threads_found = ?,
+                last_analyzed = ?,
+                last_skipped_existing = ?,
+                last_failed = ?,
+                last_force_rescan = ?,
+                last_result_status = ?,
+                last_result_message = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                now,
+                counts["threads_found"],
+                counts["analyzed"],
+                counts["skipped_existing"],
+                counts["failed"],
+                1 if force_rescan else 0,
+                status,
+                message,
+                now,
+                preset_id,
+            ),
+        )
+        connection.commit()
+
+
 def scan_saved_preset(preset_id, force_rescan=False):
     preset = get_scan_preset(preset_id)
 
     if not preset:
         raise ValueError("Scan preset not found")
 
-    result = scan_slack_channel_for_threads(
-        preset["channel_id"],
-        lookback_hours=preset["default_lookback_hours"],
-        force_rescan=force_rescan,
-    )
-
-    return preset, result
+    try:
+        result = scan_slack_channel_for_threads(
+            preset["channel_id"],
+            lookback_hours=preset["default_lookback_hours"],
+            force_rescan=force_rescan,
+        )
+        detail = scan_preset_detail(preset, result, force_rescan=force_rescan)
+        update_scan_preset_last_result(
+            preset["id"],
+            result,
+            force_rescan=force_rescan,
+            status="success",
+            message=scan_preset_detail_summary(detail),
+        )
+        return preset, result
+    except Exception as error:
+        update_scan_preset_last_result(
+            preset["id"],
+            {"threads_found": 0, "analyzed": 0, "skipped_existing": 0, "failed": 1},
+            force_rescan=force_rescan,
+            status="error",
+            message=str(error),
+        )
+        raise
 
 
 def scan_all_saved_presets(force_rescan=False):
-    """Scan every saved preset and return a combined summary.
-
-    This keeps auto-scan groundwork explicit: only channels saved as presets are
-    scanned, each preset uses its own default lookback, and failures are counted
-    without stopping the rest of the batch.
-    """
+    """Scan every saved preset and return both aggregate and per-preset results."""
     presets = get_scan_presets()
     result = {
         "presets_total": len(presets),
@@ -1867,6 +1995,7 @@ def scan_all_saved_presets(force_rescan=False):
         "analyzed": 0,
         "skipped_existing": 0,
         "failed": 0,
+        "details": [],
     }
 
     for preset in presets:
@@ -1876,15 +2005,39 @@ def scan_all_saved_presets(force_rescan=False):
                 lookback_hours=preset["default_lookback_hours"],
                 force_rescan=force_rescan,
             )
+            detail = scan_preset_detail(preset, scan_result, force_rescan=force_rescan)
+            update_scan_preset_last_result(
+                preset["id"],
+                scan_result,
+                force_rescan=force_rescan,
+                status="success",
+                message=scan_preset_detail_summary(detail),
+            )
             result["presets_scanned"] += 1
-            result["threads_found"] += int(scan_result.get("threads_found", 0) or 0)
-            result["analyzed"] += int(scan_result.get("analyzed", 0) or 0)
-            result["skipped_existing"] += int(scan_result.get("skipped_existing", 0) or 0)
-            result["failed"] += int(scan_result.get("failed", 0) or 0)
-        except Exception:
+        except Exception as error:
             logger.exception("Saved scan preset failed: id=%s channel=%s", preset.get("id"), preset.get("channel_id"))
+            scan_result = {"threads_found": 0, "analyzed": 0, "skipped_existing": 0, "failed": 1}
+            detail = scan_preset_detail(
+                preset,
+                scan_result,
+                force_rescan=force_rescan,
+                status="error",
+                error_message=str(error),
+            )
+            update_scan_preset_last_result(
+                preset["id"],
+                scan_result,
+                force_rescan=force_rescan,
+                status="error",
+                message=str(error),
+            )
             result["presets_failed"] += 1
-            result["failed"] += 1
+
+        result["details"].append(detail)
+        result["threads_found"] += int(detail.get("threads_found", 0) or 0)
+        result["analyzed"] += int(detail.get("analyzed", 0) or 0)
+        result["skipped_existing"] += int(detail.get("skipped_existing", 0) or 0)
+        result["failed"] += int(detail.get("failed", 0) or 0)
 
     return result
 
@@ -1895,13 +2048,20 @@ def format_scan_all_presets_result(result):
     if presets_total <= 0:
         return "No saved scan presets to scan."
 
-    return (
+    summary = (
         f"Scanned {int(result.get('presets_scanned', 0) or 0)} of {presets_total} preset(s): "
         f"{int(result.get('threads_found', 0) or 0)} thread(s) found, "
         f"{int(result.get('analyzed', 0) or 0)} analyzed, "
         f"{int(result.get('skipped_existing', 0) or 0)} skipped, "
         f"{int(result.get('failed', 0) or 0)} failed."
     )
+
+    details = result.get("details", []) or []
+    if details:
+        breakdown = " | ".join(scan_preset_detail_summary(detail) for detail in details)
+        summary += f" Breakdown: {breakdown}."
+
+    return summary
 
 
 def normalize_dashboard_filter(value):
@@ -4047,6 +4207,29 @@ def render_scan_channel_form(scan_result="", channel_id=""):
     """
 
 
+def render_scan_preset_metadata(preset):
+    last_scanned_at = clean_text(preset.get("last_scanned_at", ""))
+
+    if not last_scanned_at:
+        return '<span class="scan-preset-last-result">Last scanned: never</span>'
+
+    status = clean_text(preset.get("last_result_status", "")) or "success"
+    force_label = "force" if int(preset.get("last_force_rescan", 0) or 0) else "normal"
+    result_summary = (
+        f"Last scanned: {last_scanned_at} · {force_label} · "
+        f"{int(preset.get('last_threads_found', 0) or 0)} found, "
+        f"{int(preset.get('last_analyzed', 0) or 0)} analyzed, "
+        f"{int(preset.get('last_skipped_existing', 0) or 0)} skipped, "
+        f"{int(preset.get('last_failed', 0) or 0)} failed"
+    )
+
+    message = clean_text(preset.get("last_result_message", ""))
+    if message and status == "error":
+        result_summary += f" · {message}"
+
+    return f'<span class="scan-preset-last-result {html_escape(status)}">{html_escape(result_summary)}</span>'
+
+
 def render_scan_presets_section(active_channel_id=""):
     active_channel_id = dashboard_channel_filter(active_channel_id)
     presets = get_scan_presets()
@@ -4062,6 +4245,7 @@ def render_scan_presets_section(active_channel_id=""):
                 <div class="scan-preset-copy">
                     <strong>{html_escape(preset.get('label', ''))}</strong>
                     <span>{html_escape(channel_id)} · {html_escape(preset.get('default_lookback_hours', 24))}h lookback</span>
+                    {render_scan_preset_metadata(preset)}
                 </div>
                 <div class="scan-preset-actions">
                     <a class="preset-link" href="{html_escape(open_url)}">Open</a>
@@ -4339,6 +4523,18 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
             .empty {{ text-align: center; padding: 42px; }}
             @media (max-width: 1050px) {{ .dashboard-layout {{ grid-template-columns: 1fr; }} .dashboard-sidebar {{ position: static; }} }}
             @media (max-width: 800px) {{ header, main {{ padding-left: 18px; padding-right: 18px; }} .dashboard-search {{ grid-template-columns: 1fr; }} .risk-grid {{ grid-template-columns: 1fr; }} .thread-summary, .section-header, .risk-card-main, .item-row-main {{ flex-direction: column; }} .count-chips, .item-actions {{ justify-content: flex-start; }} }}
+        
+        .scan-preset-last-result {{
+            display: block;
+            margin-top: 0.25rem;
+            font-size: 0.82rem;
+            color: #64748b;
+            line-height: 1.25;
+        }}
+        .scan-preset-last-result.error {{
+            color: #b91c1c;
+        }}
+
         </style>
     </head>
     <body>
