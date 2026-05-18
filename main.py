@@ -172,6 +172,20 @@ def database_source_key(source_key):
     return source_key or f"manual-analysis:{uuid.uuid4()}"
 
 
+def dashboard_channel_filter(channel_id):
+    return clean_text(channel_id)
+
+
+def slack_source_key_prefix_for_channel(channel_id):
+    channel_id = dashboard_channel_filter(channel_id)
+    return f"slack-thread:{channel_id}:" if channel_id else ""
+
+
+def slack_source_key_like_for_channel(channel_id):
+    prefix = slack_source_key_prefix_for_channel(channel_id)
+    return f"{prefix}%" if prefix else ""
+
+
 def item_title_for_type(item_type, item):
     if item_type == "action_item":
         return clean_text(item.get("task", ""))
@@ -872,20 +886,31 @@ def is_future_timestamp(value):
     timestamp = parse_database_timestamp(value)
     return bool(timestamp and timestamp > datetime.now())
 
-def get_recent_thread_analyses(limit=20, item_filter="all"):
+def get_recent_thread_analyses(limit=20, item_filter="all", channel_id=""):
     init_database()
     item_filter = normalize_dashboard_filter(item_filter)
+    channel_id = dashboard_channel_filter(channel_id)
+
+    where_clause = ""
+    params = []
+
+    if channel_id:
+        where_clause = "WHERE source_key LIKE ?"
+        params.append(slack_source_key_like_for_channel(channel_id))
+
+    params.append(limit)
 
     with get_database_connection() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT id, source_key, source_url, summary, last_seen_reply_ts,
                    reply_count, last_scanned_at, created_at, updated_at
             FROM thread_analyses
+            {where_clause}
             ORDER BY updated_at DESC
             LIMIT ?
             """,
-            (limit,),
+            params,
         ).fetchall()
 
         entries = []
@@ -953,7 +978,6 @@ def get_recent_thread_analyses(limit=20, item_filter="all"):
             entries.append(entry)
 
         return entries
-
 
 def detected_item_to_dashboard_dict(item):
     item_type = item["item_type"]
@@ -1048,54 +1072,93 @@ def risk_item_primary_field(item_type):
     return "title"
 
 
-def get_dashboard_risks(limit=50):
+def tracked_dashboard_status(status):
+    return clean_text(status) in {"created", "matched", "possible_duplicate"}
+
+
+def github_missing_or_unhealthy(status):
+    return clean_text(status) in {"", "not_found", "error"}
+
+
+def get_dashboard_risks(limit=50, channel_id=""):
     init_database()
+    channel_id = dashboard_channel_filter(channel_id)
+
+    channel_clause = ""
+    params = [current_timestamp()]
+
+    if channel_id:
+        channel_clause = "AND thread_analyses.source_key LIKE ?"
+        params.append(slack_source_key_like_for_channel(channel_id))
+
+    params.append(limit)
 
     with get_database_connection() as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 detected_items.*,
                 thread_analyses.source_url AS source_url,
                 thread_analyses.summary AS analysis_summary
             FROM detected_items
             JOIN thread_analyses ON thread_analyses.id = detected_items.analysis_id
-            WHERE detected_items.status = 'new'
+            WHERE detected_items.status IN ('new', 'created', 'matched', 'possible_duplicate')
               AND detected_items.item_type IN ('proposed_issue', 'unresolved_question', 'blocker')
               AND (
                   detected_items.snoozed_until IS NULL
                   OR detected_items.snoozed_until = ''
                   OR detected_items.snoozed_until <= ?
               )
-            ORDER BY detected_items.created_at ASC
+              {channel_clause}
+            ORDER BY detected_items.updated_at DESC, detected_items.created_at DESC
             LIMIT ?
             """,
-            (current_timestamp(), limit),
+            params,
         ).fetchall()
 
     risks = []
 
     for row in rows:
         item_type = row["item_type"]
+        item_status = clean_text(row["status"] or "new")
         reasons = []
         age_hours = hours_since_timestamp(row["created_at"])
         priority = normalize_name(row["priority"] or "")
+        github_status = clean_text(row["github_status"] or "")
+        linear_identifier = clean_text(row["linear_identifier"] or "")
 
         if item_type == "proposed_issue":
-            if age_hours >= 24:
-                reasons.append("Untracked action item older than 24 hours")
+            if item_status == "new":
+                if age_hours >= 24:
+                    reasons.append("Untracked action item older than 24 hours")
 
-            if priority in {"high", "urgent"}:
-                reasons.append("High-priority item has not been created or matched")
+                if priority in {"high", "urgent"}:
+                    reasons.append("High-priority item has not been created or matched")
 
-            if due_date_within_days(row["due_date"], 2):
-                reasons.append("Due within 2 days and not yet tracked")
+                if due_date_within_days(row["due_date"], 2):
+                    reasons.append("Due within 2 days and not yet tracked")
 
-        elif item_type == "unresolved_question":
+            elif tracked_dashboard_status(item_status) and linear_identifier:
+                github_needs_attention = github_missing_or_unhealthy(github_status)
+
+                if not github_status:
+                    reasons.append("Tracked Linear item has not been checked on GitHub")
+                elif github_status == "not_found":
+                    reasons.append("Tracked Linear item has no matching GitHub PR")
+                elif github_status == "error":
+                    reasons.append("GitHub lookup failed")
+
+                if github_needs_attention and priority in {"high", "urgent"}:
+                    reasons.append("High-priority tracked item has no GitHub PR")
+
+                if github_needs_attention and due_date_within_days(row["due_date"], 2):
+                    reasons.append("Due soon, but no GitHub PR found")
+
+        elif item_type == "unresolved_question" and item_status == "new":
             if age_hours >= 48:
                 reasons.append("Unresolved question older than 48 hours")
 
-        elif item_type == "blocker":
+        elif item_type == "blocker" and item_status == "new":
             reasons.append("Blocker still needs review")
 
         if not reasons:
@@ -1176,25 +1239,48 @@ def slack_api_get(endpoint, params=None):
 
 
 
+def refresh_github_config_from_env():
+    """Refresh GitHub settings from the current process environment.
+
+    .env is loaded once at startup. Tests and production code can then rely on
+    os.environ as the source of truth. If .env changes locally, fully restart
+    the app so the process environment is rebuilt.
+    """
+    global GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO
+
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
+    GITHUB_REPO = os.getenv("GITHUB_REPO", "")
+
+    return {
+        "token": GITHUB_TOKEN,
+        "owner": GITHUB_OWNER,
+        "repo": GITHUB_REPO,
+    }
+
+
 def require_github_config():
+    config = refresh_github_config_from_env()
     missing = []
-    if not GITHUB_TOKEN:
+    if not config["token"]:
         missing.append("GITHUB_TOKEN")
-    if not GITHUB_OWNER:
+    if not config["owner"]:
         missing.append("GITHUB_OWNER")
-    if not GITHUB_REPO:
+    if not config["repo"]:
         missing.append("GITHUB_REPO")
 
     if missing:
         raise RuntimeError(f"Missing GitHub configuration: {', '.join(missing)}")
 
+    return config
+
 
 def github_api_get(endpoint, params=None):
-    require_github_config()
+    config = require_github_config()
     response = requests.get(
         f"{GITHUB_API_URL}/{endpoint.lstrip('/')}",
         headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Authorization": f"Bearer {config['token']}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
@@ -1286,6 +1372,7 @@ def update_detected_item_github_result(item_id, github_status, github_url=""):
 
 
 def check_github_for_detected_item(item_id):
+    refresh_github_config_from_env()
     init_database()
     with get_database_connection() as connection:
         item = connection.execute(
@@ -1321,10 +1408,10 @@ def check_github_for_detected_item(item_id):
 
 
 
-def github_check_candidate_items(search_query=""):
+def github_check_candidate_items(search_query="", channel_id=""):
     """Return visible tracked proposed issues that have a saved Linear identifier."""
     search_query = clean_text(search_query)
-    entries = get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter="tracked")
+    entries = get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter="tracked", channel_id=channel_id)
     entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
     candidates = []
     seen_ids = set()
@@ -1350,8 +1437,8 @@ def github_check_candidate_items(search_query=""):
     return candidates
 
 
-def check_github_for_tracked_items(search_query=""):
-    candidates = github_check_candidate_items(search_query)
+def check_github_for_tracked_items(search_query="", channel_id=""):
+    candidates = github_check_candidate_items(search_query, channel_id=channel_id)
     result = {
         "checked": 0,
         "found": 0,
@@ -3478,44 +3565,56 @@ def render_bulk_github_notice(bulk_message=""):
 
     return f'<div class="dashboard-notice {css_class}">{html_escape(bulk_message)}</div>'
 
-def dashboard_search_url(item_filter, search_query=""):
-    base = f"/dashboard?filter={quote(clean_text(item_filter) or 'all')}"
+def dashboard_search_url(item_filter, search_query="", channel_id=""):
+    params = {"filter": normalize_dashboard_filter(item_filter)}
     search_query = clean_text(search_query)
+    channel_id = dashboard_channel_filter(channel_id)
+
     if search_query:
-        base += f"&q={quote(search_query)}"
-    return base
+        params["q"] = search_query
+
+    if channel_id:
+        params["channel_id"] = channel_id
+
+    return f"/dashboard?{urlencode(params)}"
 
 
-def render_dashboard_filter_tabs(active_filter="all", search_query=""):
+def render_dashboard_filter_tabs(active_filter="all", search_query="", channel_id=""):
     active_filter = normalize_dashboard_filter(active_filter)
     filters = [("all", "All"), ("risks", "Risks"), ("new", "New"), ("tracked", "Tracked"), ("snoozed", "Snoozed"), ("ignored", "Ignored")]
     links = []
     for value, label in filters:
         active_class = " active-filter" if value == active_filter else ""
-        links.append(f'<a class="filter-link{active_class}" href="{html_escape(dashboard_search_url(value, search_query))}">{html_escape(label)}</a>')
+        links.append(f'<a class="filter-link{active_class}" href="{html_escape(dashboard_search_url(value, search_query, channel_id))}">{html_escape(label)}</a>')
     return '<nav class="filter-tabs">' + "".join(links) + '</nav>'
 
 
-def render_dashboard_search_form(search_query="", item_filter="all"):
+def render_dashboard_search_form(search_query="", item_filter="all", channel_id=""):
+    channel_id = dashboard_channel_filter(channel_id)
+    channel_input = f'<input type="hidden" name="channel_id" value="{html_escape(channel_id)}">' if channel_id else ""
+    clear_url = dashboard_search_url(item_filter, channel_id=channel_id)
     return f'''
         <form class="dashboard-search" method="get" action="/dashboard">
             <input type="hidden" name="filter" value="{html_escape(normalize_dashboard_filter(item_filter))}">
+            {channel_input}
             <label>
                 Search dashboard
                 <input name="q" type="search" value="{html_escape(search_query)}" placeholder="Search summary, item, assignee, FLO ID">
             </label>
             <button type="submit">Search</button>
-            <a class="clear-search" href="/dashboard?filter={html_escape(normalize_dashboard_filter(item_filter))}">Clear</a>
+            <a class="clear-search" href="{html_escape(clear_url)}">Clear</a>
         </form>
     '''
 
 
-
-def render_bulk_github_check_form(search_query="", item_filter="all"):
+def render_bulk_github_check_form(search_query="", item_filter="all", channel_id=""):
+    channel_id = dashboard_channel_filter(channel_id)
+    channel_input = f'<input type="hidden" name="channel_id" value="{html_escape(channel_id)}">' if channel_id else ""
     return f'''
         <form class="bulk-github-form" method="post" action="/dashboard/check-github-tracked">
             <input type="hidden" name="filter" value="{html_escape(normalize_dashboard_filter(item_filter))}">
             <input type="hidden" name="q" value="{html_escape(search_query)}">
+            {channel_input}
             <button type="submit" class="bulk-github-button">Check GitHub for tracked items</button>
             <span class="meta">Checks tracked proposed issues with saved FLO IDs in the current dashboard view.</span>
         </form>
@@ -3544,16 +3643,17 @@ def render_channel_scan_history(limit=5):
     """
 
 
-def render_scan_channel_form(scan_result=""):
+def render_scan_channel_form(scan_result="", channel_id=""):
+    channel_id = dashboard_channel_filter(channel_id)
     result_html = f'<div class="scan-result">{html_escape(scan_result)}</div>' if scan_result else ""
     return f"""
         <section class="scan-section sidebar-panel">
             <div>
                 <h2>Scan channel</h2>
-                <p class="meta">Scan new and changed Slack threads. Use force rescan when you want to refresh everything.</p>
+                <p class="meta">Scan new and changed Slack threads. After scanning, the dashboard focuses on that channel.</p>
             </div>
             <form class="scan-form" method="post" action="/dashboard/scan-channel">
-                <label>Channel ID<input name="channel_id" type="text" placeholder="C1234567890" required></label>
+                <label>Channel ID<input name="channel_id" type="text" placeholder="C1234567890 or G1234567890" value="{html_escape(channel_id)}" required></label>
                 <label>Lookback hours<input name="lookback_hours" type="number" min="1" max="168" value="24" required></label>
                 <label class="checkbox-label"><input name="force_rescan" type="checkbox" value="1"> Force rescan existing threads</label>
                 <button type="submit">Scan channel</button>
@@ -3561,7 +3661,6 @@ def render_scan_channel_form(scan_result=""):
             {result_html}
         </section>
     """
-
 
 def entry_item_text(item):
     return " ".join(clean_text(value) for value in item.values() if value)
@@ -3637,17 +3736,31 @@ def render_thread_card(entry, open_by_default=False):
     '''
 
 
-def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url="", github_bulk_result=""):
+def render_dashboard_channel_notice(channel_id=""):
+    channel_id = dashboard_channel_filter(channel_id)
+
+    if not channel_id:
+        return ""
+
+    return (
+        f'<div class="dashboard-notice notice-muted">Showing saved dashboard cards for channel '
+        f'<strong>{html_escape(channel_id)}</strong>. '
+        f'<a href="/dashboard">Show all channels</a></div>'
+    )
+
+
+def render_dashboard_html(scan_result="", item_filter="all", search_query="", github_status="", github_identifier="", github_url="", github_bulk_result="", channel_id=""):
     item_filter = normalize_dashboard_filter(item_filter)
     search_query = clean_text(search_query)
-    risks = [risk for risk in get_dashboard_risks() if risk_matches_search(risk, search_query)]
+    channel_id = dashboard_channel_filter(channel_id)
+    risks = [risk for risk in get_dashboard_risks(channel_id=channel_id) if risk_matches_search(risk, search_query)]
     risk_html = render_dashboard_risks(risks) if item_filter in {"all", "risks"} else ""
-    filter_tabs_html = render_dashboard_filter_tabs(item_filter, search_query)
-    search_html = render_dashboard_search_form(search_query, item_filter)
-    bulk_github_html = render_bulk_github_check_form(search_query, item_filter)
+    filter_tabs_html = render_dashboard_filter_tabs(item_filter, search_query, channel_id)
+    search_html = render_dashboard_search_form(search_query, item_filter, channel_id)
+    bulk_github_html = render_bulk_github_check_form(search_query, item_filter, channel_id)
     scan_history_html = render_channel_scan_history()
-    notice_html = render_dashboard_notice(github_status, github_identifier, github_url) + render_bulk_github_notice(github_bulk_result)
-    entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter)
+    notice_html = render_dashboard_channel_notice(channel_id) + render_dashboard_notice(github_status, github_identifier, github_url) + render_bulk_github_notice(github_bulk_result)
+    entries = [] if item_filter == "risks" else get_recent_thread_analyses(MAX_ANALYSIS_HISTORY, item_filter=item_filter, channel_id=channel_id)
     entries = [entry for entry in entries if entry_matches_search(entry, search_query)]
     cards = [render_thread_card(entry, open_by_default=False) for entry in entries]
     if not cards and item_filter != "risks":
@@ -3778,7 +3891,7 @@ def render_dashboard_html(scan_result="", item_filter="all", search_query="", gi
         <main>
             <div class="dashboard-layout">
                 <aside class="dashboard-sidebar">
-                    {render_scan_channel_form(scan_result)}
+                    {render_scan_channel_form(scan_result, channel_id)}
                     {scan_history_html}
                 </aside>
                 <section class="dashboard-content">
@@ -4045,6 +4158,7 @@ def dashboard(request: Request):
     scan_result = request.query_params.get("scan_result", "")
     item_filter = request.query_params.get("filter", "all")
     search_query = request.query_params.get("q", "")
+    channel_id = request.query_params.get("channel_id", "")
     github_status = request.query_params.get("github_status", "")
     github_identifier = request.query_params.get("github_identifier", "")
     github_url = request.query_params.get("github_url", "")
@@ -4058,10 +4172,10 @@ def dashboard(request: Request):
             github_identifier=github_identifier,
             github_url=github_url,
             github_bulk_result=github_bulk_result,
+            channel_id=channel_id,
         ),
         media_type="text/html",
     )
-
 
 @app.post("/dashboard/scan-channel")
 async def scan_channel_from_dashboard(request: Request):
@@ -4081,9 +4195,14 @@ async def scan_channel_from_dashboard(request: Request):
         logger.exception("Dashboard channel scan failed")
         message = f"Channel scan failed: {error}"
 
+    query_params = {
+        "channel_id": channel_id,
+        "scan_result": message,
+    }
+
     return Response(
         status_code=303,
-        headers={"Location": f"/dashboard?scan_result={quote(message)}"},
+        headers={"Location": f"/dashboard?{urlencode(query_params)}"},
     )
 
 
@@ -4134,7 +4253,8 @@ async def check_dashboard_tracked_items_github(request: Request):
     form = await request.form()
     item_filter = normalize_dashboard_filter(form.get("filter", "all"))
     search_query = clean_text(form.get("q", ""))
-    result = check_github_for_tracked_items(search_query=search_query)
+    channel_id = dashboard_channel_filter(form.get("channel_id", ""))
+    result = check_github_for_tracked_items(search_query=search_query, channel_id=channel_id)
     message = format_bulk_github_result(result)
     query_params = {
         "filter": item_filter,
@@ -4142,12 +4262,13 @@ async def check_dashboard_tracked_items_github(request: Request):
     }
     if search_query:
         query_params["q"] = search_query
+    if channel_id:
+        query_params["channel_id"] = channel_id
 
     return Response(
         status_code=303,
         headers={"Location": f"/dashboard?{urlencode(query_params)}"},
     )
-
 
 @app.post("/slack/interactive")
 async def slack_interactive(request: Request, background_tasks: BackgroundTasks):

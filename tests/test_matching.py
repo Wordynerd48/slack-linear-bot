@@ -1603,6 +1603,53 @@ def test_search_github_pull_request_for_linear_identifier_returns_first_pr(monke
     assert calls[0][1]["per_page"] == 1
 
 
+
+
+def test_check_github_refreshes_github_config_from_env_before_lookup(temp_database, monkeypatch):
+    source_key = "slack-thread:C123:github-refresh-config"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-123")
+
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GITHUB_OWNER", "updated-owner")
+    monkeypatch.setenv("GITHUB_REPO", "updated-repo")
+
+    observed = {}
+
+    def fake_search(linear_identifier):
+        observed["owner"] = main.GITHUB_OWNER
+        observed["repo"] = main.GITHUB_REPO
+        observed["identifier"] = linear_identifier
+        return None
+
+    monkeypatch.setattr(main, "search_github_pull_request_for_linear_identifier", fake_search)
+
+    result = main.check_github_for_detected_item(proposed_issue["id"])
+
+    assert result["status"] == "not_found"
+    assert observed == {
+        "owner": "updated-owner",
+        "repo": "updated-repo",
+        "identifier": "FLO-123",
+    }
+
+
+def test_require_github_config_reports_missing_refreshed_env(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_OWNER", raising=False)
+    monkeypatch.delenv("GITHUB_REPO", raising=False)
+    monkeypatch.setattr(main, "GITHUB_TOKEN", "old-token")
+    monkeypatch.setattr(main, "GITHUB_OWNER", "old-owner")
+    monkeypatch.setattr(main, "GITHUB_REPO", "old-repo")
+
+    with pytest.raises(RuntimeError) as error:
+        main.require_github_config()
+
+    assert "GITHUB_TOKEN" in str(error.value)
+    assert "GITHUB_OWNER" in str(error.value)
+    assert "GITHUB_REPO" in str(error.value)
+
 def test_check_github_for_detected_item_found_updates_database(temp_database, monkeypatch):
     source_key = "slack-thread:C123:github-found"
     main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
@@ -1979,3 +2026,190 @@ def test_dashboard_renders_bulk_github_check_form(temp_database):
     assert "Check GitHub for tracked items" in html
     assert 'name="filter" value="tracked"' in html
     assert 'name="q" value="checkout"' in html
+
+
+def test_risk_engine_flags_tracked_item_not_checked_on_github(temp_database):
+    source_key = "slack-thread:C123:risk-github-unchecked"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-300")
+
+    risks = risk_titles_and_reasons()
+    reasons = risks["fix checkout page shipping method persistence"]
+
+    assert "Tracked Linear item has not been checked on GitHub" in reasons
+
+
+def test_risk_engine_flags_tracked_item_with_no_matching_github_pr(temp_database):
+    source_key = "slack-thread:C123:risk-github-not-found"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-301")
+    main.update_detected_item_github_result(proposed_issue["id"], "not_found", "")
+
+    risks = risk_titles_and_reasons()
+    reasons = risks["fix checkout page shipping method persistence"]
+
+    assert "Tracked Linear item has no matching GitHub PR" in reasons
+
+
+def test_risk_engine_flags_tracked_item_with_github_error(temp_database):
+    source_key = "slack-thread:C123:risk-github-error"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-302")
+    main.update_detected_item_github_result(proposed_issue["id"], "error", "")
+
+    risks = risk_titles_and_reasons()
+    reasons = risks["fix checkout page shipping method persistence"]
+
+    assert "GitHub lookup failed" in reasons
+
+
+def test_risk_engine_flags_high_priority_tracked_item_without_github_pr(temp_database):
+    source_key = "slack-thread:C123:risk-github-high-priority"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "urgent"
+    analysis["proposed_issues"][0]["due_date"] = ""
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-303")
+
+    risks = risk_titles_and_reasons()
+    reasons = risks["fix checkout page shipping method persistence"]
+
+    assert "High-priority tracked item has no GitHub PR" in reasons
+
+
+def test_risk_engine_flags_due_soon_tracked_item_without_github_pr(temp_database):
+    source_key = "slack-thread:C123:risk-github-due-soon"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "none"
+    analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-304")
+
+    risks = risk_titles_and_reasons()
+    reasons = risks["fix checkout page shipping method persistence"]
+
+    assert "Due soon, but no GitHub PR found" in reasons
+
+
+def test_risk_engine_does_not_flag_tracked_item_with_github_pr_found(temp_database):
+    source_key = "slack-thread:C123:risk-github-found-clear"
+    analysis = saved_analysis(source_key)
+    analysis["proposed_issues"][0]["priority"] = "urgent"
+    analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", analysis)
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-305")
+    main.update_detected_item_github_result(
+        proposed_issue["id"],
+        "found",
+        "https://github.com/flow0178/slack-linear-bot/pull/305",
+    )
+
+    assert "fix checkout page shipping method persistence" not in risk_titles_and_reasons()
+
+
+def test_risk_engine_ignores_snoozed_tracked_github_risk(temp_database):
+    source_key = "slack-thread:C123:risk-github-snoozed"
+    main.save_thread_analysis(source_key, "https://example.slack.com/thread", saved_analysis(source_key))
+
+    proposed_issue = item_by_type_and_title(source_key, "proposed_issue", "fix checkout")
+    main.mark_related_detected_items_tracked(proposed_issue["id"], linear_reference="FLO-306")
+    main.update_detected_item_github_result(proposed_issue["id"], "not_found", "")
+    main.snooze_related_detected_items(proposed_issue["id"], hours=24)
+
+    assert "fix checkout page shipping method persistence" not in risk_titles_and_reasons()
+
+
+def test_recent_thread_analyses_filters_by_channel_id(temp_database):
+    old_source_key = "slack-thread:COLD123:111.000"
+    new_source_key = "slack-thread:GNEW456:222.000"
+
+    old_analysis = saved_analysis(old_source_key)
+    old_analysis["summary"] = "Old public channel work"
+    new_analysis = saved_analysis(new_source_key)
+    new_analysis["summary"] = "New private channel work"
+
+    main.save_thread_analysis(old_source_key, "https://example.slack.com/old", old_analysis)
+    main.save_thread_analysis(new_source_key, "https://example.slack.com/new", new_analysis)
+
+    entries = main.get_recent_thread_analyses(channel_id="GNEW456")
+    source_keys = {entry["source_key"] for entry in entries}
+
+    assert new_source_key in source_keys
+    assert old_source_key not in source_keys
+
+
+def test_dashboard_html_channel_filter_hides_other_channel_cards(temp_database):
+    old_source_key = "slack-thread:COLD123:333.000"
+    new_source_key = "slack-thread:GNEW456:444.000"
+
+    old_analysis = saved_analysis(old_source_key)
+    old_analysis["summary"] = "Old channel checkout work"
+    new_analysis = saved_analysis(new_source_key)
+    new_analysis["summary"] = "Private channel timezone work"
+
+    main.save_thread_analysis(old_source_key, "https://example.slack.com/old", old_analysis)
+    main.save_thread_analysis(new_source_key, "https://example.slack.com/new", new_analysis)
+
+    html = main.render_dashboard_html(channel_id="GNEW456")
+
+    assert "Showing saved dashboard cards for channel" in html
+    assert "GNEW456" in html
+    assert "Private channel timezone work" in html
+    assert "Old channel checkout work" not in html
+    assert "channel_id" in html
+
+
+def test_dashboard_risks_filters_by_channel_id(temp_database):
+    old_source_key = "slack-thread:COLD123:555.000"
+    new_source_key = "slack-thread:GNEW456:666.000"
+
+    old_analysis = saved_analysis(old_source_key)
+    old_analysis["summary"] = "Old channel risk summary"
+    old_analysis["proposed_issues"][0]["title"] = "old channel risky issue"
+    old_analysis["proposed_issues"][0]["priority"] = "urgent"
+    old_analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+
+    new_analysis = saved_analysis(new_source_key)
+    new_analysis["summary"] = "New private channel risk summary"
+    new_analysis["proposed_issues"][0]["title"] = "new private channel risky issue"
+    new_analysis["proposed_issues"][0]["priority"] = "urgent"
+    new_analysis["proposed_issues"][0]["due_date"] = date.today().isoformat()
+
+    main.save_thread_analysis(old_source_key, "https://example.slack.com/old", old_analysis)
+    main.save_thread_analysis(new_source_key, "https://example.slack.com/new", new_analysis)
+
+    risks = main.get_dashboard_risks(channel_id="GNEW456")
+    titles = {risk["title"] for risk in risks}
+
+    assert "new private channel risky issue" in titles
+    assert "old channel risky issue" not in titles
+
+
+def test_github_bulk_candidates_filter_by_channel_id(temp_database):
+    old_source_key = "slack-thread:COLD123:777.000"
+    new_source_key = "slack-thread:GNEW456:888.000"
+
+    main.save_thread_analysis(old_source_key, "https://example.slack.com/old", saved_analysis(old_source_key))
+    main.save_thread_analysis(new_source_key, "https://example.slack.com/new", saved_analysis(new_source_key))
+
+    old_issue = item_by_type_and_title(old_source_key, "proposed_issue", "fix checkout")
+    new_issue = item_by_type_and_title(new_source_key, "proposed_issue", "fix checkout")
+
+    main.mark_related_detected_items_tracked(old_issue["id"], linear_reference="FLO-111")
+    main.mark_related_detected_items_tracked(new_issue["id"], linear_reference="FLO-222")
+
+    candidates = main.github_check_candidate_items(channel_id="GNEW456")
+
+    assert [candidate["linear_identifier"] for candidate in candidates] == ["FLO-222"]
